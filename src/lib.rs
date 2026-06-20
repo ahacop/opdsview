@@ -6,6 +6,7 @@
 pub mod app;
 pub mod cache;
 pub mod opds;
+pub mod reading;
 pub mod storage;
 pub mod ui;
 pub mod worker;

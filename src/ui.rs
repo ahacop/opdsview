@@ -12,9 +12,10 @@ use ratatui::widgets::{
 use ratatui_image::StatefulImage;
 
 use crate::app::{
-    App, BrowserState, DownloadSlot, FormState, ImageSlot, Screen, FORM_LABELS,
+    App, BrowserState, DownloadSlot, FormState, ImageSlot, ReadingSlot, Screen, FORM_LABELS,
 };
 use crate::opds::Entry;
+use crate::reading::ReadingStats;
 
 const ACCENT: Color = Color::Cyan;
 
@@ -48,7 +49,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             } else {
                 "↑↓ move   Enter open   / search   ⌫/h back   n next   q feeds"
             };
-            render_browser(frame, chunks[1], &app.screen, &mut app.images, &app.downloads);
+            render_browser(
+                frame,
+                chunks[1],
+                &app.screen,
+                &mut app.images,
+                &app.downloads,
+                &app.reading,
+            );
             render_help(frame, chunks[2], help);
         }
     }
@@ -210,12 +218,13 @@ fn render_browser(
     screen: &Screen,
     images: &mut HashMap<String, ImageSlot>,
     downloads: &HashMap<String, DownloadSlot>,
+    reading: &HashMap<String, ReadingSlot>,
 ) {
     let Screen::Browser(b) = screen else { return };
 
     // The detail "show page" takes over the whole browser area when open.
     if b.detail.is_some() {
-        render_detail_page(frame, area, b, images, downloads);
+        render_detail_page(frame, area, b, images, downloads, reading);
         return;
     }
 
@@ -429,6 +438,55 @@ fn push_meta_lines(lines: &mut Vec<Line>, entry: &Entry) {
     }
 }
 
+/// Append the scraped reading-length and difficulty lines, if available.
+///
+/// Shown only on the full detail page, where the metrics have been fetched.
+fn push_reading_lines(lines: &mut Vec<Line>, reading: Option<&ReadingSlot>) {
+    match reading {
+        Some(ReadingSlot::Ready(stats)) => {
+            if let Some(length) = reading_length(stats) {
+                lines.push(meta_line("Length", length));
+            }
+            if let Some(ease) = reading_ease(stats) {
+                lines.push(meta_line("Reading ease", ease));
+            }
+        }
+        Some(ReadingSlot::Loading) => lines.push(Line::from(Span::styled(
+            "Reading info…",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        ))),
+        Some(ReadingSlot::Unavailable) | None => {}
+    }
+}
+
+/// "60,463 words (3 hours 40 minutes)", as far as the available fields allow.
+fn reading_length(stats: &ReadingStats) -> Option<String> {
+    let words = stats.word_count.map(|n| format!("{} words", group_thousands(n)));
+    match (words, &stats.reading_time) {
+        (Some(w), Some(t)) => Some(format!("{w} ({t})")),
+        (Some(w), None) => Some(w),
+        (None, Some(t)) => Some(t.clone()),
+        (None, None) => None,
+    }
+}
+
+/// "72.56 (fairly easy)", as far as the available fields allow.
+fn reading_ease(stats: &ReadingStats) -> Option<String> {
+    let ease = stats.reading_ease.as_deref()?;
+    Some(match &stats.difficulty {
+        Some(d) => format!("{ease} ({d})"),
+        None => ease.to_string(),
+    })
+}
+
+/// A "Label: value" metadata line with a dimmed label.
+fn meta_line(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
+        Span::raw(value),
+    ])
+}
+
 // --- Detail "show page" --------------------------------------------------
 
 fn render_detail_page(
@@ -437,6 +495,7 @@ fn render_detail_page(
     b: &BrowserState,
     images: &mut HashMap<String, ImageSlot>,
     downloads: &HashMap<String, DownloadSlot>,
+    reading: &HashMap<String, ReadingSlot>,
 ) {
     let Some(entry) = b.detail_entry() else { return };
     let Some(detail) = b.detail.as_ref() else { return };
@@ -470,11 +529,17 @@ fn render_detail_page(
         .constraints([Constraint::Min(3), Constraint::Length(formats_height)])
         .split(panes[1]);
 
-    render_detail_info(frame, right[0], entry);
+    let reading_slot = entry.web_link().and_then(|l| reading.get(&l.href));
+    render_detail_info(frame, right[0], entry, reading_slot);
     render_detail_formats(frame, right[1], &acquisitions, detail.format, downloads);
 }
 
-fn render_detail_info(frame: &mut Frame, area: Rect, entry: &Entry) {
+fn render_detail_info(
+    frame: &mut Frame,
+    area: Rect,
+    entry: &Entry,
+    reading: Option<&ReadingSlot>,
+) {
     let mut lines = vec![Line::from(Span::styled(
         entry.title.clone(),
         Style::default().add_modifier(Modifier::BOLD).fg(ACCENT),
@@ -486,6 +551,7 @@ fn render_detail_info(frame: &mut Frame, area: Rect, entry: &Entry) {
         )));
     }
     push_meta_lines(&mut lines, entry);
+    push_reading_lines(&mut lines, reading);
     if let Some(rights) = &entry.rights {
         lines.push(Line::from(vec![
             Span::styled("Rights: ", Style::default().fg(Color::DarkGray)),
@@ -626,6 +692,20 @@ fn date_only(ts: &str) -> &str {
         Some(10) => &ts[..10],
         _ => ts,
     }
+}
+
+/// Insert thousands separators into a number, e.g. `60463` → `60,463`.
+fn group_thousands(n: u32) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let len = digits.len();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Format a byte count as a compact human-readable size.

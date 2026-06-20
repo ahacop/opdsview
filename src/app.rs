@@ -9,6 +9,7 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 
 use crate::opds::{Entry, Feed};
+use crate::reading::ReadingStats;
 use crate::storage::{Config, Feed as FeedConfig};
 use crate::worker::{Request, Response};
 
@@ -117,6 +118,15 @@ pub enum DownloadSlot {
     Failed(String),
 }
 
+/// Loaded state of a publication's scraped reading metrics, keyed by its web
+/// page URL.
+pub enum ReadingSlot {
+    Loading,
+    Ready(ReadingStats),
+    /// The page had no parseable metrics (e.g. a non-SE catalog).
+    Unavailable,
+}
+
 /// Which screen the UI is showing.
 pub enum Screen {
     FeedList,
@@ -137,6 +147,8 @@ pub struct App {
     pub images: HashMap<String, ImageSlot>,
     /// Book downloads in progress or completed, keyed by acquisition URL.
     pub downloads: HashMap<String, DownloadSlot>,
+    /// Scraped reading metrics, keyed by a publication's web page URL.
+    pub reading: HashMap<String, ReadingSlot>,
     pub picker: Picker,
 }
 
@@ -156,6 +168,7 @@ impl App {
             outbox: Vec::new(),
             images: HashMap::new(),
             downloads: HashMap::new(),
+            reading: HashMap::new(),
             picker,
         }
     }
@@ -407,8 +420,19 @@ impl App {
         let Some(link) = entry.nav_link() else {
             // A publication entry: open its detail / download view instead.
             if entry.acquisition_links().next().is_some() {
+                // Read everything off `entry` before mutating `b` (entry borrows b).
                 let entry_index = b.list.selected().unwrap_or(0);
+                let web_url = entry.web_link().map(|l| l.href.clone());
                 b.detail = Some(DetailState { entry_index, format: 0 });
+                // Lazily fetch reading metrics from the publication's web page.
+                // (self.reading/outbox are fields disjoint from self.screen.)
+                if let Some(url) = web_url
+                    && !self.reading.contains_key(&url)
+                {
+                    let auth = b.auth.clone();
+                    self.reading.insert(url.clone(), ReadingSlot::Loading);
+                    self.outbox.push(Request::Reading { url, auth });
+                }
             } else {
                 self.status = "No catalog link or downloads for this entry".into();
             }
@@ -568,6 +592,13 @@ impl App {
                 self.downloads.insert(url, slot);
             }
             Response::Search { query, result } => self.on_search(query, result),
+            Response::Reading { url, result } => {
+                let slot = match result {
+                    Ok(stats) => ReadingSlot::Ready(stats),
+                    Err(_) => ReadingSlot::Unavailable,
+                };
+                self.reading.insert(url, slot);
+            }
         }
     }
 

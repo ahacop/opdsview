@@ -13,6 +13,7 @@ use image::DynamicImage;
 
 use crate::cache::Cache;
 use crate::opds::Feed;
+use crate::reading::{extract_reading_text, ReadingStats};
 use crate::storage::download_dir;
 
 /// How long a cached feed response is considered fresh.
@@ -31,6 +32,9 @@ pub enum Request {
     /// Run an OpenSearch query: resolve the description at `desc_url`, then
     /// fetch the resulting acquisition feed.
     Search { desc_url: String, query: String, auth: Auth },
+    /// Scrape supplementary reading metrics from a publication's web page,
+    /// keyed by that page's URL.
+    Reading { url: String, auth: Auth },
 }
 
 /// A response delivered from the worker back to the UI thread.
@@ -40,6 +44,7 @@ pub enum Response {
     Download { url: String, result: Result<PathBuf> },
     /// A search result: the resolved feed URL and its parsed feed.
     Search { query: String, result: Result<(String, Feed)> },
+    Reading { url: String, result: Result<ReadingStats> },
 }
 
 /// Handle to the worker thread.
@@ -77,6 +82,10 @@ impl Worker {
                     Request::Search { desc_url, query, auth } => {
                         let result = search(&http, &cache, &desc_url, &query, &auth);
                         let _ = resp_tx.send(Response::Search { query, result });
+                    }
+                    Request::Reading { url, auth } => {
+                        let result = fetch_reading(&http, &cache, &url, &auth);
+                        let _ = resp_tx.send(Response::Reading { url, result });
                     }
                 }
             }
@@ -142,6 +151,32 @@ fn fetch_image(
     let img = image::load_from_memory(&bytes)
         .with_context(|| format!("decoding image {url}"))?;
     Ok(img)
+}
+
+/// Fetch a publication's web page and parse its reading metrics.
+///
+/// Only the extracted one-line sentence is cached, keyed by the page URL.
+/// These metrics never meaningfully change, so the cache is kept indefinitely
+/// (like cover images); re-parsing the cached sentence is cheap.
+fn fetch_reading(
+    http: &reqwest::blocking::Client,
+    cache: &Cache,
+    url: &str,
+    auth: &Auth,
+) -> Result<ReadingStats> {
+    let sentence = match cache.get(url, "read", None) {
+        Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        None => {
+            let bytes = get_bytes(http, url, auth)?;
+            let html = String::from_utf8_lossy(&bytes);
+            let text = extract_reading_text(&html)
+                .with_context(|| format!("no reading-ease info on {url}"))?;
+            let _ = cache.put(url, "read", text.as_bytes());
+            text
+        }
+    };
+    ReadingStats::parse(&sentence)
+        .with_context(|| format!("unrecognized reading-ease text from {url}"))
 }
 
 /// Resolve an OpenSearch description and fetch the matching acquisition feed.
