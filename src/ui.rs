@@ -17,12 +17,9 @@ use crate::app::{
     ReaderState, ReadingSlot, Screen,
 };
 use crate::opds::Entry;
-use crate::reader::{Block as ContentBlock, render_chapter};
+use crate::reader::{Block as ContentBlock, block_height, render_chapter, search_book};
 use crate::reading::ReadingStats;
 use crate::worker::Request;
-
-/// Rows reserved for an inline image block in the reader.
-const IMAGE_ROWS: u16 = 16;
 
 const ACCENT: Color = Color::Cyan;
 
@@ -105,7 +102,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if let Screen::Browser(b) = &app.screen
         && let Some(query) = &b.search_query
     {
-        render_search_input(frame, area, query);
+        render_search_input(frame, area, query, " Search catalog ");
+    }
+
+    if let Screen::Reader(r) = &app.screen
+        && let Some(query) = &r.search.input
+    {
+        render_search_input(frame, area, query, " Find in book ");
     }
 
     if let Some(confirm) = &app.confirm {
@@ -114,14 +117,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 }
 
 /// A centered one-line text input box for entering a search query.
-fn render_search_input(frame: &mut Frame, area: Rect, query: &str) {
+fn render_search_input(frame: &mut Frame, area: Rect, query: &str, title: &str) {
     let popup = centered_rect(60, 3, area);
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
-        .title(" Search catalog ");
+        .title(title.to_string());
     let p = Paragraph::new(Line::from(format!(" {query}█"))).block(block);
     frame.render_widget(p, popup);
 }
@@ -733,13 +736,28 @@ fn render_reader_screen(frame: &mut Frame, content: Rect, help_area: Rect, app: 
     let Screen::Reader(reader) = screen else {
         return;
     };
-    let help = if reader.toc_open {
-        "↑↓ move   Enter open   t/Esc close"
+    let help = if reader.search.input.is_some() {
+        "type to search   Enter run   Esc cancel".to_string()
+    } else if reader.toc_open {
+        "↑↓ move   Enter open   t/Esc close".to_string()
+    } else if !reader.search.query.is_empty() {
+        if reader.search.matches.is_empty() {
+            format!(
+                "no match for \"{}\"   / find   q close",
+                reader.search.query
+            )
+        } else {
+            format!(
+                "match {}/{}   n/N next/prev   / find   q close",
+                reader.search.current + 1,
+                reader.search.matches.len()
+            )
+        }
     } else {
-        "↑↓ scroll   n/p chapter   t contents   x external   q close"
+        "↑↓ scroll   n/p chapter   t contents   / find   x external   q close".to_string()
     };
     render_reader(frame, content, reader, images, outbox);
-    render_help(frame, help_area, help);
+    render_help(frame, help_area, &help);
 }
 
 fn render_reader(
@@ -762,6 +780,7 @@ fn render_reader(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     reader.viewport_height = inner.height;
+    reader.viewport_width = inner.width;
 
     if reader.loading {
         let p = Paragraph::new("\n  Opening book…").style(Style::default().fg(Color::DarkGray));
@@ -799,6 +818,33 @@ fn render_reader(
     let max_scroll = reader.content_height.saturating_sub(inner.height);
     reader.scroll = reader.scroll.min(max_scroll);
 
+    // Match rows depend on width; recompute them if the terminal was resized
+    // since the search was run, so highlights stay aligned.
+    if !reader.search.query.is_empty() && reader.search.width != inner.width {
+        let query = reader.search.query.clone();
+        reader.search.matches = search_book(
+            &reader.chapters,
+            inner.width.max(1),
+            &reader.book_path,
+            &query,
+        );
+        reader.search.width = inner.width;
+        if reader.search.current >= reader.search.matches.len() {
+            reader.search.current = 0;
+        }
+    }
+
+    // Highlight ranges for matches in the current chapter, grouped by row.
+    let mut highlights: HashMap<u16, Vec<(usize, usize, bool)>> = HashMap::new();
+    for (i, m) in reader.search.matches.iter().enumerate() {
+        if m.chapter == reader.chapter {
+            highlights
+                .entry(m.row)
+                .or_default()
+                .push((m.col, m.len, i == reader.search.current));
+        }
+    }
+
     let scroll = reader.scroll;
     let view_h = inner.height;
     let view_bottom = scroll.saturating_add(view_h);
@@ -827,7 +873,21 @@ fn render_reader(
         );
         match blk {
             ContentBlock::Text(lines) => {
-                let p = Paragraph::new(lines.clone()).scroll((vstart - top, 0));
+                let lines: Vec<Line> = if highlights.is_empty() {
+                    lines.clone()
+                } else {
+                    lines
+                        .iter()
+                        .enumerate()
+                        .map(
+                            |(j, line)| match highlights.get(&top.saturating_add(j as u16)) {
+                                Some(ranges) => highlight_line(line, ranges),
+                                None => line.clone(),
+                            },
+                        )
+                        .collect()
+                };
+                let p = Paragraph::new(lines).scroll((vstart - top, 0));
                 frame.render_widget(p, rect);
             }
             ContentBlock::Image { key, src } => {
@@ -871,11 +931,52 @@ fn render_reader(
     }
 }
 
-/// Height of a reader block in rows.
-fn block_height(b: &ContentBlock) -> u32 {
-    match b {
-        ContentBlock::Text(lines) => lines.len() as u32,
-        ContentBlock::Image { .. } => IMAGE_ROWS as u32,
+/// Rebuild a line with the given character `ranges` `(start, len, is_current)`
+/// restyled as search highlights, splitting spans as needed.
+fn highlight_line(line: &Line<'static>, ranges: &[(usize, usize, bool)]) -> Line<'static> {
+    // Expand to one styled cell per character, overlay the highlight style on
+    // matched ranges, then coalesce runs of equal style back into spans.
+    let mut cells: Vec<(char, Style)> = Vec::new();
+    for span in &line.spans {
+        for c in span.content.chars() {
+            cells.push((c, span.style));
+        }
+    }
+    for &(start, len, is_current) in ranges {
+        let style = highlight_style(is_current);
+        for cell in cells.iter_mut().skip(start).take(len) {
+            cell.1 = style;
+        }
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut text = String::new();
+    let mut style: Option<Style> = None;
+    for (c, st) in cells {
+        if Some(st) != style {
+            if let Some(prev) = style {
+                spans.push(Span::styled(std::mem::take(&mut text), prev));
+            }
+            style = Some(st);
+        }
+        text.push(c);
+    }
+    if let Some(prev) = style {
+        spans.push(Span::styled(text, prev));
+    }
+    Line::from(spans)
+}
+
+/// Style for a highlighted search match: the focused match stands out from the
+/// rest.
+fn highlight_style(is_current: bool) -> Style {
+    if is_current {
+        Style::default()
+            .bg(Color::Yellow)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(Color::DarkGray).fg(Color::White)
     }
 }
 

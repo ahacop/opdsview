@@ -42,6 +42,87 @@ pub enum Block {
     },
 }
 
+/// Rows a [`Block::Image`] occupies in the reader's content space. Search and
+/// rendering share this so match row offsets line up with what is drawn.
+pub const IMAGE_ROWS: u16 = 16;
+
+/// Height of a reader block in content-space rows.
+pub fn block_height(b: &Block) -> u32 {
+    match b {
+        Block::Text(lines) => lines.len() as u32,
+        Block::Image { .. } => IMAGE_ROWS as u32,
+    }
+}
+
+/// One occurrence of a search query within a book, located in content space so
+/// the reader can scroll it into view and highlight it.
+#[derive(Debug, Clone)]
+pub struct Match {
+    /// Spine index of the chapter the match is in.
+    pub chapter: usize,
+    /// Content-space row of the matched line within that chapter.
+    pub row: u16,
+    /// Character offset of the match within the line's text.
+    pub col: usize,
+    /// Length of the match in characters.
+    pub len: usize,
+}
+
+/// Find every (non-overlapping) occurrence of `query` across the whole book,
+/// rendering each chapter at `width` so match rows match what the reader draws.
+/// Matching is ASCII case-insensitive.
+pub fn search_book(chapters: &[String], width: u16, book_path: &str, query: &str) -> Vec<Match> {
+    let needle: Vec<char> = query.chars().collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    for (ci, html) in chapters.iter().enumerate() {
+        let blocks = render_chapter(html, width, ci, book_path);
+        let mut row: u16 = 0;
+        for blk in &blocks {
+            if let Block::Text(lines) = blk {
+                for line in lines {
+                    let plain: Vec<char> =
+                        line.spans.iter().flat_map(|s| s.content.chars()).collect();
+                    for (col, len) in match_ranges(&plain, &needle) {
+                        matches.push(Match {
+                            chapter: ci,
+                            row,
+                            col,
+                            len,
+                        });
+                    }
+                    row = row.saturating_add(1);
+                }
+            } else {
+                row = row.saturating_add(block_height(blk) as u16);
+            }
+        }
+    }
+    matches
+}
+
+/// Character ranges `(start, len)` where `needle` occurs in `haystack`,
+/// non-overlapping and ASCII case-insensitive.
+fn match_ranges(haystack: &[char], needle: &[char]) -> Vec<(usize, usize)> {
+    let n = needle.len();
+    let mut out = Vec::new();
+    if n == 0 || haystack.len() < n {
+        return out;
+    }
+    let mut i = 0;
+    while i + n <= haystack.len() {
+        if (0..n).all(|k| haystack[i + k].eq_ignore_ascii_case(&needle[k])) {
+            out.push((i, n));
+            i += n;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Convert one chapter's XHTML into width-wrapped, styled blocks.
 ///
 /// Text reflows to `width` columns. A line carrying an image becomes its own
@@ -262,6 +343,28 @@ mod tests {
         let text = text_of(&blocks);
         assert!(text.contains("before"));
         assert!(text.contains("after"));
+    }
+
+    #[test]
+    fn search_book_finds_matches_case_insensitively_across_chapters() {
+        let chapters = vec![
+            "<p>The quick brown fox</p>".to_string(),
+            "<p>Foxes and a FOX</p>".to_string(),
+        ];
+        let matches = search_book(&chapters, 80, "book", "fox");
+        // "fox" once in chapter 0, then "Fox" (in "Foxes") and "FOX" in chapter 1.
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0].chapter, 0);
+        assert_eq!(matches[1].chapter, 1);
+        assert_eq!(matches[2].chapter, 1);
+        // Each match spans the length of the query.
+        assert!(matches.iter().all(|m| m.len == 3));
+    }
+
+    #[test]
+    fn search_book_empty_query_finds_nothing() {
+        let chapters = vec!["<p>anything</p>".to_string()];
+        assert!(search_book(&chapters, 80, "book", "").is_empty());
     }
 
     #[test]

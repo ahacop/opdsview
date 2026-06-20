@@ -219,6 +219,23 @@ pub enum Confirm {
     DeleteBook(usize),
 }
 
+/// In-book string search state for the reader.
+#[derive(Default)]
+pub struct SearchState {
+    /// The query being typed; `Some` while the find input box is open and
+    /// capturing keys.
+    pub input: Option<String>,
+    /// The query the current `matches` were found for (empty if none run yet).
+    pub query: String,
+    /// All matches for `query`, ordered by (chapter, row, col).
+    pub matches: Vec<crate::reader::Match>,
+    /// Index into `matches` of the focused match.
+    pub current: usize,
+    /// Terminal width `matches` were computed at, so the UI can recompute them
+    /// after a resize (match rows are width-dependent).
+    pub width: u16,
+}
+
 /// State of the built-in EPUB reader.
 pub struct ReaderState {
     /// Library id of the book being read, for persisting progress. `None` if the
@@ -245,6 +262,10 @@ pub struct ReaderState {
     pub content_height: u16,
     /// Height of the reader viewport, recorded each render for paging.
     pub viewport_height: u16,
+    /// Width of the reader viewport, recorded each render (for search).
+    pub viewport_width: u16,
+    /// In-book search state.
+    pub search: SearchState,
     /// Whether the table-of-contents popup is open.
     pub toc_open: bool,
     /// Selected row in the TOC popup.
@@ -274,6 +295,16 @@ struct ReaderInit {
     book_id: Option<String>,
     progress: Option<ReadingProgress>,
     title: String,
+}
+
+/// Scroll the reader so the currently focused search match sits a little below
+/// the top of the viewport. The renderer clamps the result to the real content.
+fn focus_match(r: &mut ReaderState) {
+    if let Some(m) = r.search.matches.get(r.search.current) {
+        r.chapter = m.chapter.min(r.chapters.len().saturating_sub(1));
+        let margin = r.viewport_height / 4;
+        r.scroll = m.row.saturating_sub(margin);
+    }
 }
 
 pub struct App {
@@ -943,6 +974,8 @@ impl App {
             rendered_for: None,
             content_height: 0,
             viewport_height: 0,
+            viewport_width: 0,
+            search: SearchState::default(),
             toc_open: false,
             toc_selected: 0,
             return_to: Box::new(return_to),
@@ -955,6 +988,11 @@ impl App {
 
     /// Key handling for the built-in reader.
     fn handle_reader_key(&mut self, key: KeyEvent) {
+        // The find input box captures all keys while open.
+        if matches!(&self.screen, Screen::Reader(r) if r.search.input.is_some()) {
+            self.handle_reader_search_key(key);
+            return;
+        }
         let Screen::Reader(r) = &mut self.screen else {
             return;
         };
@@ -992,6 +1030,11 @@ impl App {
             KeyCode::Char('g') => r.scroll = 0,
             // Clamped to the real content height by the renderer.
             KeyCode::Char('G') => r.scroll = u16::MAX,
+            // While a search is active, n/N step through matches (vim-style);
+            // otherwise n stays the next-chapter binding.
+            KeyCode::Char('n') if !r.search.matches.is_empty() => self.step_match(1),
+            KeyCode::Char('N') if !r.search.matches.is_empty() => self.step_match(-1),
+            KeyCode::Char('/') => r.search.input = Some(String::new()),
             KeyCode::Char('n') | KeyCode::Char('l') | KeyCode::Right => {
                 if r.chapter + 1 < r.chapters.len() {
                     r.chapter += 1;
@@ -1015,6 +1058,71 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Key handling while the reader's find input box is open.
+    fn handle_reader_search_key(&mut self, key: KeyEvent) {
+        let Screen::Reader(r) = &mut self.screen else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => r.search.input = None,
+            KeyCode::Enter => self.submit_reader_search(),
+            KeyCode::Backspace => {
+                if let Some(q) = r.search.input.as_mut() {
+                    q.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(q) = r.search.input.as_mut() {
+                    q.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Run the typed query across the whole book and jump to the first match at
+    /// or after the current position.
+    fn submit_reader_search(&mut self) {
+        let Screen::Reader(r) = &mut self.screen else {
+            return;
+        };
+        let query = r.search.input.take().unwrap_or_default().trim().to_string();
+        r.search.query = query.clone();
+        r.search.current = 0;
+        r.search.width = r.viewport_width;
+        if query.is_empty() {
+            r.search.matches.clear();
+            return;
+        }
+        r.search.matches =
+            crate::reader::search_book(&r.chapters, r.viewport_width.max(1), &r.book_path, &query);
+        if r.search.matches.is_empty() {
+            return;
+        }
+        let pos = (r.chapter, r.scroll);
+        r.search.current = r
+            .search
+            .matches
+            .iter()
+            .position(|m| (m.chapter, m.row) >= pos)
+            .unwrap_or(0);
+        focus_match(r);
+    }
+
+    /// Move the focused match by `delta` (wrapping) and scroll it into view.
+    fn step_match(&mut self, delta: isize) {
+        let Screen::Reader(r) = &mut self.screen else {
+            return;
+        };
+        let len = r.search.matches.len();
+        if len == 0 {
+            return;
+        }
+        let cur = r.search.current as isize;
+        r.search.current = (cur + delta).rem_euclid(len as isize) as usize;
+        focus_match(r);
     }
 
     /// Persist the reading position and return to the screen the reader was
