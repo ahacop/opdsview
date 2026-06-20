@@ -58,11 +58,20 @@ impl Category {
     }
 }
 
+/// An entry's author: a display name plus, when the feed supplies it, the URI
+/// of the author's catalog page (`<author><uri>`). Standard Ebooks points this
+/// at the author's collection, e.g. `https://standardebooks.org/ebooks/willa-cather`.
+#[derive(Debug, Clone, Default)]
+pub struct Author {
+    pub name: String,
+    pub uri: Option<String>,
+}
+
 /// An OPDS entry: either a navigation item (sub-catalog) or a publication.
 #[derive(Debug, Clone, Default)]
 pub struct Entry {
     pub title: String,
-    pub authors: Vec<String>,
+    pub authors: Vec<Author>,
     /// Short plain-text blurb (`<summary>`).
     pub summary: Option<String>,
     /// Long description (`<content>`), with HTML markup stripped.
@@ -84,6 +93,11 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Author display names, for joining or searching where the URI is unwanted.
+    pub fn author_names(&self) -> impl Iterator<Item = &str> {
+        self.authors.iter().map(|a| a.name.as_str())
+    }
+
     /// The link to follow when this entry is a navigation item.
     pub fn nav_link(&self) -> Option<&Link> {
         // A navigation entry has a catalog-typed link and no acquisition links.
@@ -294,14 +308,23 @@ fn parse_entry<F: Fn(&str) -> String>(node: &roxmltree::Node, resolve: &F) -> En
                 }
             }
             "author" => {
-                if let Some(name) = child
-                    .children()
-                    .find(|c| c.is_element() && local_name(c) == "name")
-                {
-                    let n = text_of(&name);
-                    if !n.is_empty() {
-                        entry.authors.push(n);
+                let mut name = String::new();
+                let mut uri = None;
+                for c in child.children().filter(|c| c.is_element()) {
+                    match local_name(&c) {
+                        "name" => name = text_of(&c),
+                        // The author's catalog page; resolve in case it's relative.
+                        "uri" => {
+                            let u = text_of(&c);
+                            if !u.is_empty() {
+                                uri = Some(resolve(&u));
+                            }
+                        }
+                        _ => {}
                     }
+                }
+                if !name.is_empty() {
+                    entry.authors.push(Author { name, uri });
                 }
             }
             "link" => {
@@ -427,7 +450,7 @@ mod tests {
       </entry>
       <entry>
         <title>A Great Book</title>
-        <author><name>Jane Doe</name></author>
+        <author><name>Jane Doe</name><uri>https://example.com/authors/jane-doe</uri></author>
         <summary>A thrilling tale.</summary>
         <content type="html">&lt;p&gt;First paragraph &amp;amp; more.&lt;/p&gt; &lt;p&gt;Second paragraph.&lt;/p&gt;</content>
         <dc:language>en-GB</dc:language>
@@ -472,7 +495,11 @@ mod tests {
         let feed = Feed::parse(SAMPLE, "https://example.com/opds").unwrap();
         let book = &feed.entries[1];
         assert!(!book.is_navigation());
-        assert_eq!(book.authors, vec!["Jane Doe"]);
+        assert_eq!(book.author_names().collect::<Vec<_>>(), vec!["Jane Doe"]);
+        assert_eq!(
+            book.authors[0].uri.as_deref(),
+            Some("https://example.com/authors/jane-doe")
+        );
         assert_eq!(book.summary.as_deref(), Some("A thrilling tale."));
         // Full image is preferred over the thumbnail.
         assert_eq!(

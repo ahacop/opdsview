@@ -400,7 +400,7 @@ fn render_entry_text(frame: &mut Frame, area: Rect, entry: &Entry) {
 
     if !entry.authors.is_empty() {
         lines.push(Line::from(Span::styled(
-            entry.authors.join(", "),
+            entry.author_names().collect::<Vec<_>>().join(", "),
             Style::default().add_modifier(Modifier::ITALIC),
         )));
     }
@@ -586,12 +586,26 @@ fn render_detail_info(frame: &mut Frame, area: Rect, entry: &Entry, reading: Opt
     ))];
     if !entry.authors.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("by {}", entry.authors.join(", ")),
+            format!("by {}", entry.author_names().collect::<Vec<_>>().join(", ")),
             Style::default().add_modifier(Modifier::ITALIC),
         )));
     }
     push_meta_lines(&mut lines, entry);
     push_reading_lines(&mut lines, reading);
+    // The author's catalog page, when the feed supplies it. Labelled with the
+    // author's name (distinct from the italic "by …" line) and shown as a raw
+    // URL so terminals that auto-link will make it clickable, like "Web:" below.
+    for author in &entry.authors {
+        if let Some(uri) = &author.uri {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}: ", author.name),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(uri.clone(), Style::default().fg(Color::Blue)),
+            ]));
+        }
+    }
     if let Some(web) = entry.web_link() {
         lines.push(Line::from(vec![
             Span::styled("Web: ", Style::default().fg(Color::DarkGray)),

@@ -131,7 +131,7 @@ impl LibraryBackend {
 fn book_matches(book: &LibraryBook, q: &str) -> bool {
     let e = &book.entry;
     e.title.to_lowercase().contains(q)
-        || e.authors.iter().any(|a| a.to_lowercase().contains(q))
+        || e.author_names().any(|a| a.to_lowercase().contains(q))
         || e.subjects().any(|s| s.to_lowercase().contains(q))
         || e.genres().any(|s| s.to_lowercase().contains(q))
 }
@@ -1072,7 +1072,10 @@ mod tests {
     fn book(id: &str, title: &str, author: &str) -> LibraryBook {
         let entry = Entry {
             title: title.to_string(),
-            authors: vec![author.to_string()],
+            authors: vec![crate::opds::Author {
+                name: author.to_string(),
+                uri: None,
+            }],
             ..Default::default()
         };
         LibraryBook {

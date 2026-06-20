@@ -35,7 +35,9 @@ fn main() -> anyhow::Result<()> {
             println!("      -> {}", entry.nav_link().unwrap().href);
             continue;
         }
-        println!("      authors:   {}", entry.authors.join(", "));
+        for author in &entry.authors {
+            println!("      author:    {} {:?}", author.name, author.uri);
+        }
         println!("      published: {:?}", entry.published);
         println!("      language:  {:?}", entry.language);
         println!("      publisher: {:?}", entry.publisher);

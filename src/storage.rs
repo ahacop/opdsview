@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::opds::{Category, Entry, Link, REL_ACQUISITION, REL_IMAGE};
+use crate::opds::{Author, Category, Entry, Link, REL_ACQUISITION, REL_IMAGE};
 use crate::reading::ReadingStats;
 
 /// A saved OPDS catalog, including optional HTTP Basic Auth credentials.
@@ -127,6 +127,10 @@ pub struct LibraryEntry {
     pub title: String,
     #[serde(default)]
     pub authors: Vec<String>,
+    /// Author catalog-page URIs, parallel to `authors` (empty string where a
+    /// URI was unknown). Absent in sidecars written before author links existed.
+    #[serde(default)]
+    pub author_uris: Vec<String>,
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
@@ -161,7 +165,12 @@ impl LibraryEntry {
     pub fn from_entry(entry: &Entry) -> Self {
         LibraryEntry {
             title: entry.title.clone(),
-            authors: entry.authors.clone(),
+            authors: entry.author_names().map(str::to_string).collect(),
+            author_uris: entry
+                .authors
+                .iter()
+                .map(|a| a.uri.clone().unwrap_or_default())
+                .collect(),
             summary: entry.summary.clone(),
             content: entry.content.clone(),
             language: entry.language.clone(),
@@ -270,7 +279,15 @@ fn library_to_entry(dir: &Path, meta: &LibraryEntry) -> Entry {
     }
     Entry {
         title: meta.title.clone(),
-        authors: meta.authors.clone(),
+        authors: meta
+            .authors
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Author {
+                name: name.clone(),
+                uri: meta.author_uris.get(i).filter(|u| !u.is_empty()).cloned(),
+            })
+            .collect(),
         summary: meta.summary.clone(),
         content: meta.content.clone(),
         language: meta.language.clone(),
@@ -562,7 +579,10 @@ mod tests {
         assert_eq!(books.len(), 1);
         let book = &books[0];
         assert_eq!(book.entry.title, "The Professor's House");
-        assert_eq!(book.entry.authors, vec!["Willa Cather"]);
+        assert_eq!(
+            book.entry.author_names().collect::<Vec<_>>(),
+            vec!["Willa Cather"]
+        );
 
         // The cover link resolves to a local file that exists.
         let cover = book.entry.image_link().expect("cover link");
