@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
+use directories::{ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
 
 /// A saved OPDS catalog, including optional HTTP Basic Auth credentials.
@@ -95,4 +95,17 @@ fn config_file() -> Result<PathBuf> {
 /// Directory used for cached feed and image data.
 pub fn cache_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().to_path_buf())
+}
+
+/// Directory where downloaded books are saved.
+///
+/// Prefers the user's `Downloads` folder (under an `opdsview` subdirectory),
+/// falling back to the application data directory when no such folder exists.
+pub fn download_dir() -> Result<PathBuf> {
+    if let Some(dirs) = UserDirs::new()
+        && let Some(downloads) = dirs.download_dir()
+    {
+        return Ok(downloads.join("opdsview"));
+    }
+    Ok(project_dirs()?.data_dir().join("downloads"))
 }

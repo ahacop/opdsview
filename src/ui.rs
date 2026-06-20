@@ -11,7 +11,9 @@ use ratatui::widgets::{
 };
 use ratatui_image::StatefulImage;
 
-use crate::app::{App, BrowserState, FormState, ImageSlot, Screen, FORM_LABELS};
+use crate::app::{
+    App, BrowserState, DownloadSlot, FormState, ImageSlot, Screen, FORM_LABELS,
+};
 use crate::opds::Entry;
 
 const ACCENT: Color = Color::Cyan;
@@ -38,13 +40,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_form(frame, chunks[1], form);
             render_help(frame, chunks[2], "Tab/↑↓ field   type to edit   Enter save   Esc cancel");
         }
-        Screen::Browser(_) => {
-            render_browser(frame, chunks[1], &app.screen, &mut app.images);
-            render_help(
-                frame,
-                chunks[2],
-                "↑↓ move   Enter open   ⌫/h back   n next page   q feeds",
-            );
+        Screen::Browser(b) => {
+            let help = if b.detail.is_some() {
+                "↑↓ format   Enter/d download   ⌫/h/Esc back"
+            } else {
+                "↑↓ move   Enter open   ⌫/h back   n next page   q feeds"
+            };
+            render_browser(frame, chunks[1], &app.screen, &mut app.images, &app.downloads);
+            render_help(frame, chunks[2], help);
         }
     }
 
@@ -185,8 +188,15 @@ fn render_browser(
     area: Rect,
     screen: &Screen,
     images: &mut HashMap<String, ImageSlot>,
+    downloads: &HashMap<String, DownloadSlot>,
 ) {
     let Screen::Browser(b) = screen else { return };
+
+    // The detail "show page" takes over the whole browser area when open.
+    if b.detail.is_some() {
+        render_detail_page(frame, area, b, images, downloads);
+        return;
+    }
 
     let panes = Layout::default()
         .direction(Direction::Horizontal)
@@ -332,6 +342,8 @@ fn render_entry_text(frame: &mut Frame, area: Rect, entry: &Entry) {
             Style::default().add_modifier(Modifier::ITALIC),
         )));
     }
+
+    push_meta_lines(&mut lines, entry);
     lines.push(Line::from(""));
 
     if let Some(summary) = &entry.summary {
@@ -346,17 +358,175 @@ fn render_entry_text(frame: &mut Frame, area: Rect, entry: &Entry) {
             Style::default().add_modifier(Modifier::BOLD),
         )));
         for link in downloads {
-            let label = if link.title.is_empty() {
-                pretty_mime(&link.mime).to_string()
-            } else {
-                format!("{} ({})", link.title, pretty_mime(&link.mime))
-            };
-            lines.push(Line::from(format!("  • {label}")));
+            lines.push(Line::from(format!("  • {}", format_label(link))));
+        }
+        lines.push(Line::from(Span::styled(
+            "Press Enter to view & download",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+    }
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: true });
+    frame.render_widget(p, area);
+}
+
+/// Append the compact metadata block (date, language, publisher, subjects)
+/// shared by the browse detail pane.
+fn push_meta_lines(lines: &mut Vec<Line>, entry: &Entry) {
+    let mut meta: Vec<(&str, String)> = Vec::new();
+    if let Some(date) = entry.published.as_deref() {
+        meta.push(("Published", date_only(date).to_string()));
+    }
+    if let Some(lang) = &entry.language {
+        meta.push(("Language", lang.clone()));
+    }
+    if let Some(pubr) = &entry.publisher {
+        meta.push(("Publisher", pubr.clone()));
+    }
+    for (label, value) in meta {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{label}: "),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(value),
+        ]));
+    }
+    if !entry.categories.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Subjects: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(entry.categories.join(", ")),
+        ]));
+    }
+}
+
+// --- Detail "show page" --------------------------------------------------
+
+fn render_detail_page(
+    frame: &mut Frame,
+    area: Rect,
+    b: &BrowserState,
+    images: &mut HashMap<String, ImageSlot>,
+    downloads: &HashMap<String, DownloadSlot>,
+) {
+    let Some(entry) = b.detail_entry() else { return };
+    let Some(detail) = b.detail.as_ref() else { return };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(format!(" {} ", entry.title));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .margin(1)
+        .split(inner);
+
+    render_cover(frame, panes[0], entry, images);
+
+    // Right column: metadata/description on top, download formats below.
+    let acquisitions: Vec<&crate::opds::Link> = entry.acquisition_links().collect();
+    let formats_height = (acquisitions.len() as u16).saturating_add(2);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(formats_height)])
+        .split(panes[1]);
+
+    render_detail_info(frame, right[0], entry);
+    render_detail_formats(frame, right[1], &acquisitions, detail.format, downloads);
+}
+
+fn render_detail_info(frame: &mut Frame, area: Rect, entry: &Entry) {
+    let mut lines = vec![Line::from(Span::styled(
+        entry.title.clone(),
+        Style::default().add_modifier(Modifier::BOLD).fg(ACCENT),
+    ))];
+    if !entry.authors.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("by {}", entry.authors.join(", ")),
+            Style::default().add_modifier(Modifier::ITALIC),
+        )));
+    }
+    push_meta_lines(&mut lines, entry);
+    if let Some(rights) = &entry.rights {
+        lines.push(Line::from(vec![
+            Span::styled("Rights: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(rights.clone()),
+        ]));
+    }
+    if let Some(web) = entry.web_link() {
+        lines.push(Line::from(vec![
+            Span::styled("Web: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(web.href.clone(), Style::default().fg(Color::Blue)),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    // Prefer the long description; fall back to the short summary.
+    let body = entry.content.as_deref().or(entry.summary.as_deref());
+    if let Some(text) = body {
+        for para in text.split('\n') {
+            lines.push(Line::from(para.to_string()));
         }
     }
 
     let p = Paragraph::new(lines).wrap(Wrap { trim: true });
     frame.render_widget(p, area);
+}
+
+fn render_detail_formats(
+    frame: &mut Frame,
+    area: Rect,
+    links: &[&crate::opds::Link],
+    selected: usize,
+    downloads: &HashMap<String, DownloadSlot>,
+) {
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(Span::styled(
+            " Download ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+
+    if links.is_empty() {
+        let p = Paragraph::new("  No downloadable formats").block(block);
+        frame.render_widget(p, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = links
+        .iter()
+        .enumerate()
+        .map(|(i, link)| {
+            let marker = if i == selected { "▸ " } else { "  " };
+            let status = match downloads.get(&link.href) {
+                Some(DownloadSlot::Pending) => {
+                    Span::styled("  ↓ downloading…", Style::default().fg(Color::Yellow))
+                }
+                Some(DownloadSlot::Done(_)) => {
+                    Span::styled("  ✓ saved", Style::default().fg(Color::Green))
+                }
+                Some(DownloadSlot::Failed(_)) => {
+                    Span::styled("  ✗ failed", Style::default().fg(Color::Red))
+                }
+                None => Span::raw(""),
+            };
+            let style = if i == selected {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{marker}{}", format_label(link)), style),
+                status,
+            ]))
+        })
+        .collect();
+
+    frame.render_widget(List::new(items).block(block), area);
 }
 
 // --- Popups --------------------------------------------------------------
@@ -401,12 +571,50 @@ fn crumb_path(b: &BrowserState) -> String {
     }
 }
 
+/// Human label for a download link: format, optional title, and size.
+fn format_label(link: &crate::opds::Link) -> String {
+    let fmt = pretty_mime(&link.mime);
+    let mut label = if link.title.is_empty() {
+        fmt.to_string()
+    } else {
+        format!("{fmt} — {}", link.title)
+    };
+    if let Some(size) = link.length {
+        label.push_str(&format!(" ({})", human_size(size)));
+    }
+    label
+}
+
+/// Just the `YYYY-MM-DD` portion of an ISO-8601 timestamp.
+fn date_only(ts: &str) -> &str {
+    match ts.find('T') {
+        Some(10) => &ts[..10],
+        _ => ts,
+    }
+}
+
+/// Format a byte count as a compact human-readable size.
+fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    let b = bytes as f64;
+    if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn pretty_mime(mime: &str) -> &str {
     match mime {
         "application/epub+zip" => "EPUB",
-        "application/x-mobipocket-ebook" => "MOBI",
+        "application/kepub+zip" => "KEPUB",
+        "application/x-mobipocket-ebook" => "AZW3",
         "application/pdf" => "PDF",
         "application/x-cbz" => "CBZ",
+        "application/xhtml+xml" => "XHTML",
         "text/html" => "HTML",
         other => other,
     }

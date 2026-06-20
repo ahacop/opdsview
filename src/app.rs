@@ -1,6 +1,7 @@
 //! Application state, input handling, and response handling.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
@@ -57,6 +58,14 @@ pub struct Crumb {
     pub selected: usize,
 }
 
+/// Open detail ("show page") for a single publication entry.
+pub struct DetailState {
+    /// Index of the entry within the current feed.
+    pub entry_index: usize,
+    /// Index of the highlighted acquisition format.
+    pub format: usize,
+}
+
 /// State while browsing a single OPDS catalog.
 pub struct BrowserState {
     pub auth: Auth,
@@ -67,6 +76,8 @@ pub struct BrowserState {
     pub error: Option<String>,
     pub current_url: String,
     pub current_title: String,
+    /// When `Some`, the full-page detail view for a publication is open.
+    pub detail: Option<DetailState>,
     /// Selection index to restore once the in-flight feed finishes loading.
     restore_select: Option<usize>,
 }
@@ -77,6 +88,12 @@ impl BrowserState {
         let feed = self.feed.as_ref()?;
         feed.entries.get(self.list.selected()?)
     }
+
+    /// The entry whose detail view is open, if any.
+    pub fn detail_entry(&self) -> Option<&Entry> {
+        let detail = self.detail.as_ref()?;
+        self.feed.as_ref()?.entries.get(detail.entry_index)
+    }
 }
 
 /// Loaded state of a cover image, keyed by image URL.
@@ -84,6 +101,13 @@ pub enum ImageSlot {
     Loading,
     Ready(Box<StatefulProtocol>),
     Failed,
+}
+
+/// Progress of a book download, keyed by its acquisition URL.
+pub enum DownloadSlot {
+    Pending,
+    Done(PathBuf),
+    Failed(String),
 }
 
 /// Which screen the UI is showing.
@@ -104,6 +128,8 @@ pub struct App {
     /// Outgoing network requests, drained by the main loop after each update.
     pub outbox: Vec<Request>,
     pub images: HashMap<String, ImageSlot>,
+    /// Book downloads in progress or completed, keyed by acquisition URL.
+    pub downloads: HashMap<String, DownloadSlot>,
     pub picker: Picker,
 }
 
@@ -122,6 +148,7 @@ impl App {
             should_quit: false,
             outbox: Vec::new(),
             images: HashMap::new(),
+            downloads: HashMap::new(),
             picker,
         }
     }
@@ -195,6 +222,11 @@ impl App {
     }
 
     fn handle_browser_key(&mut self, key: KeyEvent) {
+        // The detail ("show page") overlay captures all keys while open.
+        if matches!(&self.screen, Screen::Browser(b) if b.detail.is_some()) {
+            self.handle_detail_key(key);
+            return;
+        }
         let Screen::Browser(b) = &mut self.screen else { return };
         let len = b.feed.as_ref().map_or(0, |f| f.entries.len());
         match key.code {
@@ -285,6 +317,7 @@ impl App {
             error: None,
             current_url: url.clone(),
             current_title: title,
+            detail: None,
             restore_select: None,
         };
         self.screen = Screen::Browser(browser);
@@ -297,7 +330,13 @@ impl App {
         let Screen::Browser(b) = &mut self.screen else { return };
         let Some(entry) = b.selected_entry() else { return };
         let Some(link) = entry.nav_link() else {
-            self.status = "Not a catalog link (publication entry)".into();
+            // A publication entry: open its detail / download view instead.
+            if entry.acquisition_links().next().is_some() {
+                let entry_index = b.list.selected().unwrap_or(0);
+                b.detail = Some(DetailState { entry_index, format: 0 });
+            } else {
+                self.status = "No catalog link or downloads for this entry".into();
+            }
             return;
         };
         let next_url = link.href.clone();
@@ -315,6 +354,56 @@ impl App {
         b.feed = None;
         b.restore_select = Some(0);
         self.outbox.push(Request::Feed { url: next_url, auth });
+    }
+
+    /// Key handling while the publication detail view is open.
+    fn handle_detail_key(&mut self, key: KeyEvent) {
+        let Screen::Browser(b) = &mut self.screen else { return };
+        let Some(detail) = b.detail.as_mut() else { return };
+        let formats = b
+            .feed
+            .as_ref()
+            .and_then(|f| f.entries.get(detail.entry_index))
+            .map_or(0, |e| e.acquisition_links().count());
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
+                b.detail = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if formats > 0 {
+                    detail.format = (detail.format + 1).min(formats - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                detail.format = detail.format.saturating_sub(1);
+            }
+            KeyCode::Enter | KeyCode::Char('d') => self.download_selected_format(),
+            _ => {}
+        }
+    }
+
+    /// Queue a download of the format highlighted in the detail view.
+    fn download_selected_format(&mut self) {
+        let Some((url, auth)) = self.selected_format_target() else {
+            return;
+        };
+        // Don't re-queue a download that's already running.
+        if matches!(self.downloads.get(&url), Some(DownloadSlot::Pending)) {
+            self.status = "Already downloading…".into();
+            return;
+        }
+        self.downloads.insert(url.clone(), DownloadSlot::Pending);
+        self.status = "Downloading…".into();
+        self.outbox.push(Request::Download { url, auth });
+    }
+
+    /// The `(url, auth)` of the acquisition link selected in the detail view.
+    fn selected_format_target(&self) -> Option<(String, Auth)> {
+        let Screen::Browser(b) = &self.screen else { return None };
+        let detail = b.detail.as_ref()?;
+        let entry = b.feed.as_ref()?.entries.get(detail.entry_index)?;
+        let link = entry.acquisition_links().nth(detail.format)?;
+        Some((link.href.clone(), b.auth.clone()))
     }
 
     fn go_back(&mut self) {
@@ -381,6 +470,20 @@ impl App {
                     Err(_) => ImageSlot::Failed,
                 };
                 self.images.insert(url, slot);
+            }
+            Response::Download { url, result } => {
+                let slot = match result {
+                    Ok(path) => {
+                        self.status = format!("Saved to {}", path.display());
+                        DownloadSlot::Done(path)
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        self.status = format!("Download failed: {msg}");
+                        DownloadSlot::Failed(msg)
+                    }
+                };
+                self.downloads.insert(url, slot);
             }
         }
     }

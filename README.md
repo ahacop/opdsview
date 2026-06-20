@@ -11,7 +11,12 @@ and have responses cached locally.
   touching a config file. Each feed can carry a username/password for HTTP Basic
   Auth.
 - **Browse catalogs** — drill into navigation feeds, page through results, and
-  inspect publications (authors, summary, available formats).
+  inspect publications (authors, publication date, language, publisher, subjects,
+  summary, and available formats).
+- **Publication detail & downloads** — press `Enter` on a book to open a full
+  detail page with its cover, full description, metadata, and a list of
+  downloadable formats (with file sizes). Pick a format and download it to your
+  `Downloads/opdsview/` folder.
 - **Inline cover images** — covers are rendered directly in the terminal using
   the best protocol your terminal supports (Kitty, Sixel, iTerm2), falling back
   to Unicode half-blocks everywhere else.
@@ -52,10 +57,17 @@ A `nix develop` shell with the full toolchain is provided via `flake.nix`.
 | --- | --- |
 | `↑`/`k`, `↓`/`j` | Move selection |
 | `g`/`G` | Jump to top/bottom |
-| `Enter`/`l`/`→` | Follow a navigation entry |
+| `Enter`/`l`/`→` | Follow a navigation entry, or open a publication's detail page |
 | `Backspace`/`h`/`←` | Go back (or return to the feed list) |
 | `n` | Next page |
 | `q`/`Esc` | Return to the feed list |
+
+### Publication detail
+| Key | Action |
+| --- | --- |
+| `↑`/`k`, `↓`/`j` | Move between download formats |
+| `Enter`/`d` | Download the selected format |
+| `Backspace`/`h`/`Esc`/`q` | Close the detail page |
 
 ## Storage locations
 
@@ -66,6 +78,9 @@ Paths follow the platform conventions (via the `directories` crate):
   plain text here.
 - **Cache** — feed XML and cover images under the cache directory
   (e.g. `~/.cache/opdsview/`), keyed by a SHA-256 of the request URL.
+- **Downloads** — books are saved to an `opdsview/` subfolder of your
+  `Downloads` directory (e.g. `~/Downloads/opdsview/`), falling back to the
+  app data directory when no `Downloads` folder exists.
 
 ## Notes on terminal image support
 

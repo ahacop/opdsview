@@ -3,6 +3,7 @@
 //! All HTTP I/O and image decoding happens on a dedicated thread so the UI
 //! event loop never blocks. Requests and responses are exchanged over channels.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -12,6 +13,7 @@ use image::DynamicImage;
 
 use crate::cache::Cache;
 use crate::opds::Feed;
+use crate::storage::download_dir;
 
 /// How long a cached feed response is considered fresh.
 const FEED_TTL: Duration = Duration::from_secs(15 * 60);
@@ -24,12 +26,15 @@ pub enum Request {
     Feed { url: String, auth: Auth },
     /// Fetch and decode a cover image, keyed by its URL.
     Image { url: String, auth: Auth },
+    /// Download a book to disk, keyed by its acquisition URL.
+    Download { url: String, auth: Auth },
 }
 
 /// A response delivered from the worker back to the UI thread.
 pub enum Response {
     Feed { url: String, result: Result<Feed> },
     Image { url: String, result: Result<DynamicImage> },
+    Download { url: String, result: Result<PathBuf> },
 }
 
 /// Handle to the worker thread.
@@ -59,6 +64,10 @@ impl Worker {
                     Request::Image { url, auth } => {
                         let result = fetch_image(&http, &cache, &url, &auth);
                         let _ = resp_tx.send(Response::Image { url, result });
+                    }
+                    Request::Download { url, auth } => {
+                        let result = download_book(&http, &url, &auth);
+                        let _ = resp_tx.send(Response::Download { url, result });
                     }
                 }
             }
@@ -124,4 +133,47 @@ fn fetch_image(
     let img = image::load_from_memory(&bytes)
         .with_context(|| format!("decoding image {url}"))?;
     Ok(img)
+}
+
+/// Download a book to the user's downloads directory and return its path.
+fn download_book(http: &reqwest::blocking::Client, url: &str, auth: &Auth) -> Result<PathBuf> {
+    let dir = download_dir().context("resolving downloads directory")?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating downloads directory {}", dir.display()))?;
+    let bytes = get_bytes(http, url, auth)?;
+    let path = dir.join(filename_from_url(url));
+    std::fs::write(&path, &bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// Derive a sensible filename from a download URL's last path segment.
+fn filename_from_url(url: &str) -> String {
+    let name = url::Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            u.path_segments()
+                .and_then(|mut s| s.next_back())
+                .map(|s| s.to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "download".to_string());
+    // Strip any leftover query fragment and percent-decode nothing fancy.
+    name.split(['?', '#']).next().unwrap_or(&name).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filename_from_url;
+
+    #[test]
+    fn derives_filename_from_url() {
+        assert_eq!(
+            filename_from_url("https://se.org/a/b/cather_house.epub?source=feed"),
+            "cather_house.epub"
+        );
+        assert_eq!(filename_from_url("https://se.org/x.azw3"), "x.azw3");
+        // A URL with no usable last segment falls back to a default.
+        assert_eq!(filename_from_url("https://se.org/"), "download");
+    }
 }
