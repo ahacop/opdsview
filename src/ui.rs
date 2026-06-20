@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -425,7 +425,13 @@ fn render_detail_page(
         .margin(1)
         .split(inner);
 
-    render_cover(frame, panes[0], entry, images);
+    // Inset the cover a little so it doesn't crowd the panel border or the
+    // metadata column.
+    let cover_area = panes[0].inner(Margin {
+        horizontal: 2,
+        vertical: 0,
+    });
+    render_cover(frame, cover_area, entry, images);
 
     // Right column: metadata/description on top, download formats below.
     let acquisitions: Vec<&crate::opds::Link> = entry.acquisition_links().collect();
