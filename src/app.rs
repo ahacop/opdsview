@@ -1025,7 +1025,16 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace => self.close_reader(),
             KeyCode::Char('j') | KeyCode::Down => r.scroll = r.scroll.saturating_add(1),
             KeyCode::Char('k') | KeyCode::Up => r.scroll = r.scroll.saturating_sub(1),
-            KeyCode::Char(' ') | KeyCode::PageDown => r.scroll = r.scroll.saturating_add(page),
+            // Page down; once already at the chapter's end, advance to the next.
+            KeyCode::Char(' ') | KeyCode::PageDown => {
+                let max_scroll = r.content_height.saturating_sub(r.viewport_height);
+                if r.scroll >= max_scroll && r.chapter + 1 < r.chapters.len() {
+                    r.chapter += 1;
+                    r.scroll = 0;
+                } else {
+                    r.scroll = r.scroll.saturating_add(page);
+                }
+            }
             KeyCode::PageUp => r.scroll = r.scroll.saturating_sub(page),
             KeyCode::Char('g') => r.scroll = 0,
             // Clamped to the real content height by the renderer.
