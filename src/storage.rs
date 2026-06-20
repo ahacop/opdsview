@@ -108,6 +108,14 @@ pub fn library_dir() -> Result<PathBuf> {
 
 // --- Downloaded-book library ---------------------------------------------
 
+/// A reader's saved position within a book: the spine chapter index and the
+/// vertical scroll offset (in rendered rows) within that chapter.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReadingProgress {
+    pub chapter: usize,
+    pub scroll: u16,
+}
+
 /// One downloaded format file backing a library book.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LibraryFile {
@@ -151,6 +159,9 @@ pub struct LibraryEntry {
     pub web_url: Option<String>,
     #[serde(default)]
     pub reading: Option<ReadingStats>,
+    /// The reader's last position in this book, persisted across sessions.
+    #[serde(default)]
+    pub progress: Option<ReadingProgress>,
     /// Filename of the saved cover image, relative to [`library_dir`].
     #[serde(default)]
     pub cover_file: Option<String>,
@@ -184,6 +195,7 @@ impl LibraryEntry {
                 .collect(),
             web_url: entry.web_link().map(|l| l.href.clone()),
             reading: None,
+            progress: None,
             cover_file: None,
             files: Vec::new(),
         }
@@ -354,6 +366,8 @@ fn save_book_in(
         .as_ref()
         .map(|e| e.files.clone())
         .unwrap_or_default();
+    // Preserve any saved reading position when re-downloading another format.
+    let progress = existing.as_ref().and_then(|e| e.progress.clone());
     let mut cover_file = existing.and_then(|e| e.cover_file);
 
     // Write the ebook file.
@@ -382,14 +396,33 @@ fn save_book_in(
         }
     }
 
-    // Refresh metadata from the latest entry, keeping accumulated files/cover.
+    // Refresh metadata from the latest entry, keeping accumulated files/cover
+    // and any reading position from a previous download.
     let mut record = meta;
     record.files = files;
     record.cover_file = cover_file;
+    record.progress = progress;
 
     let json = serde_json::to_string_pretty(&record)?;
     write_atomic(&sidecar, json.as_bytes())?;
     Ok(ebook_path)
+}
+
+/// Persist the reader's position for a downloaded book, leaving the rest of its
+/// sidecar untouched. A no-op if the book has no sidecar (e.g. just deleted).
+pub fn save_progress(id: &str, progress: ReadingProgress) -> Result<()> {
+    save_progress_in(&library_dir()?, id, progress)
+}
+
+fn save_progress_in(dir: &Path, id: &str, progress: ReadingProgress) -> Result<()> {
+    let sidecar = dir.join(format!("{id}.json"));
+    let data =
+        fs::read_to_string(&sidecar).with_context(|| format!("reading {}", sidecar.display()))?;
+    let mut record: LibraryEntry =
+        serde_json::from_str(&data).with_context(|| format!("parsing {}", sidecar.display()))?;
+    record.progress = Some(progress);
+    let json = serde_json::to_string_pretty(&record)?;
+    write_atomic(&sidecar, json.as_bytes())
 }
 
 /// Delete a book's sidecar and every file it references.
@@ -671,6 +704,48 @@ mod tests {
         assert_eq!(books.len(), 1);
         assert_eq!(books[0].entry.acquisition_links().count(), 2);
         assert!(books[0].entry.image_link().is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_progress_round_trips_and_survives_redownload() {
+        let dir = temp_dir("progress");
+        save_book_in(
+            &dir,
+            sample_meta(),
+            "application/epub+zip",
+            None,
+            "https://se.org/b.epub",
+            b"E",
+            None,
+        )
+        .unwrap();
+        let id = load_library_from(&dir).unwrap()[0].id.clone();
+        assert!(load_library_from(&dir).unwrap()[0].meta.progress.is_none());
+
+        let pos = ReadingProgress {
+            chapter: 4,
+            scroll: 12,
+        };
+        save_progress_in(&dir, &id, pos.clone()).unwrap();
+        assert_eq!(
+            load_library_from(&dir).unwrap()[0].meta.progress,
+            Some(pos.clone())
+        );
+
+        // Downloading another format must not clobber the saved position.
+        save_book_in(
+            &dir,
+            sample_meta(),
+            "application/x-mobipocket-ebook",
+            None,
+            "https://se.org/b.azw3",
+            b"A",
+            None,
+        )
+        .unwrap();
+        assert_eq!(load_library_from(&dir).unwrap()[0].meta.progress, Some(pos));
 
         let _ = fs::remove_dir_all(&dir);
     }

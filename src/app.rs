@@ -9,8 +9,9 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 
 use crate::opds::{Entry, Feed};
+use crate::reader::{Block, BookContent};
 use crate::reading::ReadingStats;
-use crate::storage::{Config, Feed as FeedConfig, LibraryBook, LibraryEntry};
+use crate::storage::{Config, Feed as FeedConfig, LibraryBook, LibraryEntry, ReadingProgress};
 use crate::worker::{Request, Response};
 
 type Auth = Option<(String, String)>;
@@ -218,11 +219,61 @@ pub enum Confirm {
     DeleteBook(usize),
 }
 
+/// State of the built-in EPUB reader.
+pub struct ReaderState {
+    /// Library id of the book being read, for persisting progress. `None` if the
+    /// book isn't a tracked library entry.
+    pub book_id: Option<String>,
+    /// Filesystem path of the EPUB file (also the image-request key prefix).
+    pub book_path: String,
+    pub title: String,
+    pub loading: bool,
+    pub error: Option<String>,
+    /// Raw XHTML of each spine document, in reading order.
+    pub chapters: Vec<String>,
+    pub toc: Vec<crate::reader::TocEntry>,
+    /// Current spine index.
+    pub chapter: usize,
+    /// Vertical scroll offset, in rendered rows, within the current chapter.
+    pub scroll: u16,
+    /// Rendered blocks for the current chapter; rebuilt lazily by the UI.
+    pub blocks: Vec<Block>,
+    /// The (chapter, width) `blocks` were rendered for, so the UI re-wraps only
+    /// when the chapter or terminal width changes.
+    pub rendered_for: Option<(usize, u16)>,
+    /// Total height of `blocks` in rows (for scroll clamping).
+    pub content_height: u16,
+    /// Height of the reader viewport, recorded each render for paging.
+    pub viewport_height: u16,
+    /// Whether the table-of-contents popup is open.
+    pub toc_open: bool,
+    /// Selected row in the TOC popup.
+    pub toc_selected: usize,
+    /// Screen to restore when the reader closes (the library browser).
+    pub return_to: Box<Screen>,
+}
+
 /// Which screen the UI is showing.
 pub enum Screen {
     FeedList,
     Form(FormState),
     Browser(Box<BrowserState>),
+    Reader(Box<ReaderState>),
+}
+
+/// Whether a MIME type is an EPUB-family container the built-in reader can open.
+/// KePub is Kobo's EPUB variant — structurally an EPUB OCF zip — so the same
+/// parser handles it.
+fn is_readable_ebook(mime: &str) -> bool {
+    matches!(mime, "application/epub+zip" | "application/kepub+zip")
+}
+
+/// The data needed to launch the reader, gathered before mutating `App`.
+struct ReaderInit {
+    path: String,
+    book_id: Option<String>,
+    progress: Option<ReadingProgress>,
+    title: String,
 }
 
 pub struct App {
@@ -275,6 +326,7 @@ impl App {
             Screen::FeedList => self.handle_feed_list_key(key),
             Screen::Form(_) => self.handle_form_key(key),
             Screen::Browser(_) => self.handle_browser_key(key),
+            Screen::Reader(_) => self.handle_reader_key(key),
         }
     }
 
@@ -676,6 +728,7 @@ impl App {
             .as_ref()
             .and_then(|f| f.entries.get(detail.entry_index))
             .map_or(0, |e| e.acquisition_links().count());
+        let library = matches!(b.backend, Backend::Library(_));
         match key.code {
             KeyCode::Esc
             | KeyCode::Char('q')
@@ -692,9 +745,19 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 detail.format = detail.format.saturating_sub(1);
             }
-            KeyCode::Enter | KeyCode::Char('d') | KeyCode::Char('o') => {
-                self.activate_selected_format()
+            // In the library, Enter/o opens the built-in reader (falling back to
+            // the external opener for non-EPUB formats); in a catalog they
+            // download the selected format.
+            KeyCode::Enter | KeyCode::Char('o') => {
+                if library {
+                    self.open_reader();
+                } else {
+                    self.activate_selected_format();
+                }
             }
+            // Catalog: download. Library: force-open in the external OS reader.
+            KeyCode::Char('d') if !library => self.activate_selected_format(),
+            KeyCode::Char('x') if library => self.open_selected_format(),
             KeyCode::Char('g') => self.jump_to_downloaded(),
             _ => {}
         }
@@ -823,6 +886,155 @@ impl App {
         match crate::storage::open_in_reader(&path) {
             Ok(()) => self.status = format!("Opened {}", path.display()),
             Err(e) => self.status = format!("Open failed: {e:#}"),
+        }
+    }
+
+    /// Open the selected library book in the built-in EPUB reader. Picks the
+    /// highlighted format if it's an EPUB, else the book's first EPUB; if the
+    /// book has no EPUB format, falls back to the external OS reader.
+    fn open_reader(&mut self) {
+        // Gather what we need while only borrowing `self` immutably; `None`
+        // means "no EPUB here, fall back to the external opener".
+        let init = (|| -> Option<ReaderInit> {
+            let Screen::Browser(b) = &self.screen else {
+                return None;
+            };
+            let Backend::Library(lib) = &b.backend else {
+                return None;
+            };
+            let detail = b.detail.as_ref()?;
+            let entry = b.feed.as_ref()?.entries.get(detail.entry_index)?;
+            let links: Vec<&crate::opds::Link> = entry.acquisition_links().collect();
+            let link = links
+                .get(detail.format)
+                .copied()
+                .filter(|l| is_readable_ebook(&l.mime))
+                .or_else(|| links.iter().copied().find(|l| is_readable_ebook(&l.mime)))?;
+            let book = lib
+                .shown
+                .get(detail.entry_index)
+                .and_then(|&i| lib.books.get(i));
+            Some(ReaderInit {
+                path: link.href.clone(),
+                book_id: book.map(|bk| bk.id.clone()),
+                progress: book.and_then(|bk| bk.meta.progress.clone()),
+                title: entry.title.clone(),
+            })
+        })();
+
+        let Some(init) = init else {
+            self.open_selected_format();
+            return;
+        };
+
+        let (chapter, scroll) = init.progress.map_or((0, 0), |p| (p.chapter, p.scroll));
+        let return_to = std::mem::replace(&mut self.screen, Screen::FeedList);
+        let reader = ReaderState {
+            book_id: init.book_id,
+            book_path: init.path.clone(),
+            title: init.title,
+            loading: true,
+            error: None,
+            chapters: Vec::new(),
+            toc: Vec::new(),
+            chapter,
+            scroll,
+            blocks: Vec::new(),
+            rendered_for: None,
+            content_height: 0,
+            viewport_height: 0,
+            toc_open: false,
+            toc_selected: 0,
+            return_to: Box::new(return_to),
+        };
+        self.screen = Screen::Reader(Box::new(reader));
+        self.outbox.push(Request::OpenBook {
+            path: PathBuf::from(init.path),
+        });
+    }
+
+    /// Key handling for the built-in reader.
+    fn handle_reader_key(&mut self, key: KeyEvent) {
+        let Screen::Reader(r) = &mut self.screen else {
+            return;
+        };
+        // The table-of-contents popup captures keys while open.
+        if r.toc_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('t') | KeyCode::Char('q') => r.toc_open = false,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if !r.toc.is_empty() {
+                        r.toc_selected = (r.toc_selected + 1).min(r.toc.len() - 1);
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    r.toc_selected = r.toc_selected.saturating_sub(1);
+                }
+                KeyCode::Enter | KeyCode::Char('l') => {
+                    if let Some(entry) = r.toc.get(r.toc_selected) {
+                        r.chapter = entry.chapter.min(r.chapters.len().saturating_sub(1));
+                        r.scroll = 0;
+                    }
+                    r.toc_open = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let page = r.viewport_height.saturating_sub(2).max(1);
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace => self.close_reader(),
+            KeyCode::Char('j') | KeyCode::Down => r.scroll = r.scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => r.scroll = r.scroll.saturating_sub(1),
+            KeyCode::Char(' ') | KeyCode::PageDown => r.scroll = r.scroll.saturating_add(page),
+            KeyCode::PageUp => r.scroll = r.scroll.saturating_sub(page),
+            KeyCode::Char('g') => r.scroll = 0,
+            // Clamped to the real content height by the renderer.
+            KeyCode::Char('G') => r.scroll = u16::MAX,
+            KeyCode::Char('n') | KeyCode::Char('l') | KeyCode::Right => {
+                if r.chapter + 1 < r.chapters.len() {
+                    r.chapter += 1;
+                    r.scroll = 0;
+                }
+            }
+            KeyCode::Char('p') | KeyCode::Char('h') | KeyCode::Left => {
+                if r.chapter > 0 {
+                    r.chapter -= 1;
+                    r.scroll = 0;
+                }
+            }
+            KeyCode::Char('t') if !r.toc.is_empty() => {
+                // Start the cursor on the entry for the current chapter.
+                r.toc_selected = r
+                    .toc
+                    .iter()
+                    .rposition(|e| e.chapter <= r.chapter)
+                    .unwrap_or(0);
+                r.toc_open = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Persist the reading position and return to the screen the reader was
+    /// opened from.
+    fn close_reader(&mut self) {
+        let screen = std::mem::replace(&mut self.screen, Screen::FeedList);
+        match screen {
+            Screen::Reader(r) => {
+                if let Some(id) = r.book_id {
+                    self.outbox.push(Request::SaveProgress {
+                        id,
+                        progress: ReadingProgress {
+                            chapter: r.chapter,
+                            scroll: r.scroll,
+                        },
+                    });
+                }
+                self.screen = *r.return_to;
+            }
+            other => self.screen = other,
         }
     }
 
@@ -999,6 +1211,27 @@ impl App {
                 self.reading.insert(url, slot);
             }
             Response::Library { result } => self.on_library(result),
+            Response::Book { result } => self.on_book(result),
+        }
+    }
+
+    fn on_book(&mut self, result: anyhow::Result<BookContent>) {
+        let Screen::Reader(r) = &mut self.screen else {
+            return;
+        };
+        r.loading = false;
+        match result {
+            Ok(book) => {
+                if !book.title.is_empty() {
+                    r.title = book.title;
+                }
+                r.chapters = book.chapters;
+                r.toc = book.toc;
+                r.chapter = r.chapter.min(r.chapters.len().saturating_sub(1));
+                r.rendered_for = None;
+                r.error = None;
+            }
+            Err(e) => r.error = Some(format!("{e:#}")),
         }
     }
 

@@ -19,6 +19,10 @@ and have responses cached locally.
   detail page with its cover, full description, metadata, and a list of
   downloadable formats (with file sizes). Pick a format and download it to your
   `Downloads/opdsview/` folder.
+- **Built-in EPUB reader** — read downloaded EPUBs without leaving the terminal:
+  styled, reflowed text with inline images, chapter and table-of-contents
+  navigation, and your reading position remembered per book. Other formats
+  (PDF/AZW3/CBZ) open in your OS reader.
 - **Inline cover images** — covers are rendered directly in the terminal using
   the best protocol your terminal supports (Kitty, Sixel, iTerm2), falling back
   to Unicode half-blocks everywhere else.
@@ -68,9 +72,21 @@ A `nix develop` shell with the full toolchain is provided via `flake.nix`.
 ### Publication detail
 | Key | Action |
 | --- | --- |
-| `↑`/`k`, `↓`/`j` | Move between download formats |
-| `Enter`/`d` | Download the selected format |
+| `↑`/`k`, `↓`/`j` | Move between formats |
+| `Enter`/`o` | Catalog: download the selected format. Library: open it in the built-in reader (EPUB), or your OS reader otherwise |
+| `d` | Download the selected format (catalog) |
+| `x` | Open in the external OS reader (library) |
 | `Backspace`/`h`/`Esc`/`q` | Close the detail page |
+
+### Reader (built-in EPUB viewer)
+| Key | Action |
+| --- | --- |
+| `↑`/`k`, `↓`/`j` | Scroll |
+| `Space`/`PgDn`, `PgUp` | Page down/up |
+| `g`/`G` | Jump to chapter start/end |
+| `n`/`l`/`→`, `p`/`h`/`←` | Next / previous chapter |
+| `t` | Toggle the table of contents (`↑↓` move, `Enter` jumps, `t`/`Esc` closes) |
+| `q`/`Esc`/`Backspace` | Close the reader (saving your position) |
 
 ## Storage locations
 

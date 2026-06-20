@@ -1,20 +1,28 @@
 //! Terminal rendering for all screens.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui_image::StatefulImage;
 
 use crate::app::{
     App, Backend, BrowserState, Confirm, DownloadSlot, FORM_LABELS, FormState, ImageSlot,
-    ReadingSlot, Screen,
+    ReaderState, ReadingSlot, Screen,
 };
 use crate::opds::Entry;
+use crate::reader::{Block as ContentBlock, render_chapter};
 use crate::reading::ReadingStats;
+use crate::worker::Request;
+
+/// Rows reserved for an inline image block in the reader.
+const IMAGE_ROWS: u16 = 16;
 
 const ACCENT: Color = Color::Cyan;
 
@@ -54,7 +62,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 "type to search   Enter run   Esc cancel"
             } else if b.detail.is_some() {
                 if library {
-                    "o/Enter open in reader   ↑↓ format   ⌫/h/Esc back"
+                    "Enter/o read   x external   ↑↓ format   ⌫/h/Esc back"
                 } else if b
                     .detail
                     .as_ref()
@@ -80,6 +88,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             );
             render_help(frame, chunks[2], help);
         }
+        // The reader needs mutable access to cache rendered blocks and queue
+        // image loads, so it is rendered below this (immutable) match.
+        Screen::Reader(_) => {}
+    }
+
+    if matches!(app.screen, Screen::Reader(_)) {
+        render_reader_screen(frame, chunks[1], chunks[2], app);
     }
 
     if !app.status.is_empty() {
@@ -117,6 +132,7 @@ fn render_title_bar(frame: &mut Frame, area: Rect, screen: &Screen) {
         Screen::Form(f) if f.editing_id.is_some() => "  opdsview — Edit feed".to_string(),
         Screen::Form(_) => "  opdsview — New feed".to_string(),
         Screen::Browser(b) => format!("  opdsview — {}", b.title),
+        Screen::Reader(r) => format!("  opdsview — {}", r.title),
     };
     let bar = Paragraph::new(Line::from(Span::styled(
         title,
@@ -701,6 +717,204 @@ fn render_detail_formats(
         .collect();
 
     frame.render_widget(List::new(items).block(block), area);
+}
+
+// --- Reader --------------------------------------------------------------
+
+/// Render the reader's content and help line, with the disjoint `&mut` access
+/// the reader needs (block cache + image queue).
+fn render_reader_screen(frame: &mut Frame, content: Rect, help_area: Rect, app: &mut App) {
+    let App {
+        screen,
+        images,
+        outbox,
+        ..
+    } = app;
+    let Screen::Reader(reader) = screen else {
+        return;
+    };
+    let help = if reader.toc_open {
+        "↑↓ move   Enter open   t/Esc close"
+    } else {
+        "↑↓ scroll   n/p chapter   t contents   x external   q close"
+    };
+    render_reader(frame, content, reader, images, outbox);
+    render_help(frame, help_area, help);
+}
+
+fn render_reader(
+    frame: &mut Frame,
+    area: Rect,
+    reader: &mut ReaderState,
+    images: &mut HashMap<String, ImageSlot>,
+    outbox: &mut Vec<Request>,
+) {
+    let total = reader.chapters.len().max(1);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(format!(
+            " {} — {}/{} ",
+            reader.title,
+            reader.chapter + 1,
+            total
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    reader.viewport_height = inner.height;
+
+    if reader.loading {
+        let p = Paragraph::new("\n  Opening book…").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(p, inner);
+        return;
+    }
+    if let Some(err) = &reader.error {
+        let p = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Failed to open book",
+                Style::default().fg(Color::Red),
+            )),
+            Line::from(""),
+            Line::from(format!("  {err}")),
+        ])
+        .wrap(Wrap { trim: true });
+        frame.render_widget(p, inner);
+        return;
+    }
+
+    // Re-wrap the current chapter when the chapter or width changes.
+    if reader.rendered_for != Some((reader.chapter, inner.width)) {
+        let html = reader
+            .chapters
+            .get(reader.chapter)
+            .map(String::as_str)
+            .unwrap_or("");
+        reader.blocks = render_chapter(html, inner.width, reader.chapter, &reader.book_path);
+        let h: u32 = reader.blocks.iter().map(block_height).sum();
+        reader.content_height = h.min(u16::MAX as u32) as u16;
+        reader.rendered_for = Some((reader.chapter, inner.width));
+    }
+    // Clamp the scroll to the real content height.
+    let max_scroll = reader.content_height.saturating_sub(inner.height);
+    reader.scroll = reader.scroll.min(max_scroll);
+
+    let scroll = reader.scroll;
+    let view_h = inner.height;
+    let view_bottom = scroll.saturating_add(view_h);
+    let book_path = reader.book_path.clone();
+    let chapter = reader.chapter;
+
+    // Walk blocks in content space, drawing each block's visible slice.
+    let mut y: u16 = 0;
+    for blk in &reader.blocks {
+        let top = y;
+        let bottom = y.saturating_add(block_height(blk) as u16);
+        y = bottom;
+        if top >= view_bottom {
+            break;
+        }
+        let vstart = top.max(scroll);
+        let vend = bottom.min(view_bottom);
+        if vstart >= vend {
+            continue;
+        }
+        let rect = Rect::new(
+            inner.x,
+            inner.y + (vstart - scroll),
+            inner.width,
+            vend - vstart,
+        );
+        match blk {
+            ContentBlock::Text(lines) => {
+                let p = Paragraph::new(lines.clone()).scroll((vstart - top, 0));
+                frame.render_widget(p, rect);
+            }
+            ContentBlock::Image { key, src } => {
+                // Queue a decode the first time we see this image.
+                if !images.contains_key(key) {
+                    images.insert(key.clone(), ImageSlot::Loading);
+                    outbox.push(Request::BookImage {
+                        path: PathBuf::from(&book_path),
+                        chapter,
+                        src: src.clone(),
+                        key: key.clone(),
+                    });
+                }
+                match images.get_mut(key) {
+                    Some(ImageSlot::Ready(proto)) => {
+                        frame.render_stateful_widget(StatefulImage::new(), rect, proto.as_mut());
+                    }
+                    Some(ImageSlot::Failed) => {
+                        let p = Paragraph::new(Span::styled(
+                            "[image unavailable]",
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                        .alignment(Alignment::Center);
+                        frame.render_widget(p, center_v(rect));
+                    }
+                    _ => {
+                        let p = Paragraph::new(Span::styled(
+                            "[loading image…]",
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                        .alignment(Alignment::Center);
+                        frame.render_widget(p, center_v(rect));
+                    }
+                }
+            }
+        }
+    }
+
+    if reader.toc_open {
+        render_toc_popup(frame, area, reader);
+    }
+}
+
+/// Height of a reader block in rows.
+fn block_height(b: &ContentBlock) -> u32 {
+    match b {
+        ContentBlock::Text(lines) => lines.len() as u32,
+        ContentBlock::Image { .. } => IMAGE_ROWS as u32,
+    }
+}
+
+fn render_toc_popup(frame: &mut Frame, area: Rect, reader: &ReaderState) {
+    let rows = (reader.toc.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
+    let popup = centered_rect(60, rows, area);
+    frame.render_widget(Clear, popup);
+
+    let items: Vec<ListItem> = reader
+        .toc
+        .iter()
+        .map(|e| {
+            // Mark the entry for the chapter currently being read.
+            let style = if e.chapter == reader.chapter {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(e.label.clone(), style)))
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" Contents ");
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .bg(ACCENT)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▸ ");
+    let mut state = ListState::default();
+    state.select(Some(reader.toc_selected));
+    frame.render_stateful_widget(list, popup, &mut state);
 }
 
 // --- Popups --------------------------------------------------------------
