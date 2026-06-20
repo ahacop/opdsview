@@ -366,7 +366,11 @@ impl App {
             .and_then(|f| f.entries.get(detail.entry_index))
             .map_or(0, |e| e.acquisition_links().count());
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
+            KeyCode::Esc
+            | KeyCode::Char('q')
+            | KeyCode::Char('h')
+            | KeyCode::Left
+            | KeyCode::Backspace => {
                 b.detail = None;
             }
             KeyCode::Char('j') | KeyCode::Down => {
