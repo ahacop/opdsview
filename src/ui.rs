@@ -441,21 +441,27 @@ fn push_meta_lines(lines: &mut Vec<Line>, entry: &Entry) {
 /// Append the scraped reading-length and difficulty lines, if available.
 ///
 /// Shown only on the full detail page, where the metrics have been fetched.
+/// While loading, two placeholder lines reserve the same space the values
+/// will occupy, so the layout doesn't shift when they arrive.
 fn push_reading_lines(lines: &mut Vec<Line>, reading: Option<&ReadingSlot>) {
-    match reading {
-        Some(ReadingSlot::Ready(stats)) => {
-            if let Some(length) = reading_length(stats) {
-                lines.push(meta_line("Length", length));
-            }
-            if let Some(ease) = reading_ease(stats) {
-                lines.push(meta_line("Reading ease", ease));
-            }
-        }
-        Some(ReadingSlot::Loading) => lines.push(Line::from(Span::styled(
-            "Reading info…",
+    let (length, ease) = match reading {
+        Some(ReadingSlot::Ready(stats)) => (reading_length(stats), reading_ease(stats)),
+        Some(ReadingSlot::Loading) => (None, None),
+        // No web page to fetch from, or the page carried no metrics: show nothing.
+        Some(ReadingSlot::Unavailable) | None => return,
+    };
+    lines.push(reading_field_line("Length", length));
+    lines.push(reading_field_line("Reading ease", ease));
+}
+
+/// A reading-metric line: the value if known, else a dimmed "…" placeholder.
+fn reading_field_line(label: &str, value: Option<String>) -> Line<'static> {
+    match value {
+        Some(v) => meta_line(label, v),
+        None => Line::from(Span::styled(
+            format!("{label}: …"),
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        ))),
-        Some(ReadingSlot::Unavailable) | None => {}
+        )),
     }
 }
 
