@@ -40,12 +40,34 @@ pub struct Config {
     next_id: u64,
 }
 
+/// OPDS catalogs seeded into a fresh install on first run, as `(name, url)`
+/// pairs. These are openly accessible feeds requiring no authentication.
+const DEFAULT_FEEDS: &[(&str, &str)] = &[
+    ("Project Gutenberg", "https://www.gutenberg.org/ebooks.opds/"),
+];
+
 impl Config {
-    /// Load the config from disk, returning a default (empty) config if none exists.
+    /// A config pre-populated with the [`DEFAULT_FEEDS`], used on first run.
+    fn seeded() -> Self {
+        let mut config = Self::default();
+        for &(name, url) in DEFAULT_FEEDS {
+            config.add(Feed {
+                id: 0,
+                name: name.to_string(),
+                url: url.to_string(),
+                username: None,
+                password: None,
+            });
+        }
+        config
+    }
+
+    /// Load the config from disk. On first run (no config file yet), returns a
+    /// config seeded with the [`DEFAULT_FEEDS`] rather than an empty one.
     pub fn load() -> Result<Self> {
         let path = config_file()?;
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok(Self::seeded());
         }
         let data = fs::read_to_string(&path)
             .with_context(|| format!("reading config {}", path.display()))?;
@@ -618,6 +640,31 @@ mod tests {
         );
         // …but a different book is not.
         assert!(downloaded_book_id_in(&dir, &authors, "My Antonia").is_none());
+    }
+
+    #[test]
+    fn seeded_config_has_default_feeds_with_distinct_ids() {
+        let config = Config::seeded();
+        // One feed per default entry, names/urls preserved in order.
+        assert_eq!(config.feeds.len(), DEFAULT_FEEDS.len());
+        for (feed, &(name, url)) in config.feeds.iter().zip(DEFAULT_FEEDS) {
+            assert_eq!(feed.name, name);
+            assert_eq!(feed.url, url);
+            assert!(feed.auth().is_none());
+        }
+        // Ids are unique and next_id keeps counting from the last seeded feed,
+        // so a feed added afterwards does not collide.
+        let ids: Vec<u64> = config.feeds.iter().map(|f| f.id).collect();
+        assert_eq!(ids, (1..=DEFAULT_FEEDS.len() as u64).collect::<Vec<_>>());
+        let mut config = config;
+        config.add(Feed {
+            id: 0,
+            name: "Custom".to_string(),
+            url: "https://example.org/opds".to_string(),
+            username: None,
+            password: None,
+        });
+        assert_eq!(config.feeds.last().unwrap().id, DEFAULT_FEEDS.len() as u64 + 1);
     }
 
     #[test]
