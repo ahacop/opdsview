@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use opdsview::cache::Cache;
 use opdsview::opds::Feed;
-use opdsview::storage::cache_dir;
+use opdsview::storage::{cache_dir, LibraryEntry};
 use opdsview::worker::{Request, Response, Worker};
 
 fn main() -> anyhow::Result<()> {
@@ -36,7 +36,11 @@ fn main() -> anyhow::Result<()> {
 
     let worker = Worker::spawn(Cache::new(cache_dir()?)?)?;
     worker.request(Request::Download {
+        meta: Box::new(LibraryEntry::from_entry(entry)),
         url: link.href.clone(),
+        mime: link.mime.clone(),
+        length: link.length,
+        cover_url: entry.image_link().map(|l| l.href.clone()),
         auth,
     });
 

@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use url::{Url, form_urlencoded};
 
 /// OPDS link relation prefix marking an acquisition (downloadable) link.
-const REL_ACQUISITION: &str = "http://opds-spec.org/acquisition";
-const REL_IMAGE: &str = "http://opds-spec.org/image";
+pub(crate) const REL_ACQUISITION: &str = "http://opds-spec.org/acquisition";
+pub(crate) const REL_IMAGE: &str = "http://opds-spec.org/image";
 const REL_THUMBNAIL: &str = "http://opds-spec.org/image/thumbnail";
 
 /// Scheme URI marking a broad genre vocabulary (Standard Ebooks' own subject

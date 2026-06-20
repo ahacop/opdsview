@@ -12,7 +12,8 @@ use ratatui::widgets::{
 use ratatui_image::StatefulImage;
 
 use crate::app::{
-    App, BrowserState, DownloadSlot, FormState, ImageSlot, ReadingSlot, Screen, FORM_LABELS,
+    App, Backend, BrowserState, Confirm, DownloadSlot, FormState, ImageSlot, ReadingSlot, Screen,
+    FORM_LABELS,
 };
 use crate::opds::Entry;
 use crate::reading::ReadingStats;
@@ -42,10 +43,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_help(frame, chunks[2], "Tab/↑↓ field   type to edit   Enter save   Esc cancel");
         }
         Screen::Browser(b) => {
+            let library = matches!(b.backend, Backend::Library(_));
             let help = if b.search_query.is_some() {
                 "type to search   Enter run   Esc cancel"
             } else if b.detail.is_some() {
-                "↑↓ format   Enter/d download   ⌫/h/Esc back"
+                if library {
+                    "o/Enter open in reader   ↑↓ format   ⌫/h/Esc back"
+                } else {
+                    "↑↓ format   Enter/d download   ⌫/h/Esc back"
+                }
+            } else if library {
+                "↑↓ move   Enter open   / search   d delete   ⌫/h clear   q feeds"
             } else {
                 "↑↓ move   Enter open   / search   ⌫/h back   n next   q feeds"
             };
@@ -72,8 +80,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_search_input(frame, area, query);
     }
 
-    if let Some(id) = app.confirm_delete {
-        render_confirm_delete(frame, area, app, id);
+    if let Some(confirm) = &app.confirm {
+        render_confirm_delete(frame, area, app, confirm);
     }
 }
 
@@ -95,7 +103,7 @@ fn render_title_bar(frame: &mut Frame, area: Rect, screen: &Screen) {
         Screen::FeedList => "  opdsview — Catalogs".to_string(),
         Screen::Form(f) if f.editing_id.is_some() => "  opdsview — Edit feed".to_string(),
         Screen::Form(_) => "  opdsview — New feed".to_string(),
-        Screen::Browser(b) => format!("  opdsview — {}", b.current_title),
+        Screen::Browser(b) => format!("  opdsview — {}", b.title),
     };
     let bar = Paragraph::new(Line::from(Span::styled(
         title,
@@ -121,37 +129,38 @@ fn render_feed_list(frame: &mut Frame, area: Rect, app: &mut App) {
         .border_type(BorderType::Rounded)
         .title(" Saved feeds ");
 
-    if app.config.feeds.is_empty() {
-        let msg = Paragraph::new(vec![
-            Line::from(""),
-            Line::from("  No feeds yet.").style(Style::default().add_modifier(Modifier::BOLD)),
-            Line::from(""),
-            Line::from("  Press 'n' to add an OPDS catalog URL."),
-            Line::from("  Example: https://standardebooks.org/opds"),
-        ])
-        .block(block);
-        frame.render_widget(msg, area);
-        return;
-    }
+    // Row 0 is always the pinned local library; saved feeds follow.
+    let mut items: Vec<ListItem> = vec![ListItem::new(vec![
+        Line::from(Span::styled(
+            "📚 Downloaded books",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "  Your local library",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])];
 
-    let items: Vec<ListItem> = app
-        .config
-        .feeds
-        .iter()
-        .map(|f| {
-            let lock = if f.username.is_some() { " 🔒" } else { "" };
-            ListItem::new(vec![
-                Line::from(Span::styled(
-                    format!("{}{lock}", f.name),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    format!("  {}", f.url),
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
-        })
-        .collect();
+    items.extend(app.config.feeds.iter().map(|f| {
+        let lock = if f.username.is_some() { " 🔒" } else { "" };
+        ListItem::new(vec![
+            Line::from(Span::styled(
+                format!("{}{lock}", f.name),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("  {}", f.url),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+    }));
+
+    if app.config.feeds.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  Press 'n' to add an OPDS catalog, e.g. https://standardebooks.org/opds",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        ))));
+    }
 
     let list = List::new(items)
         .block(block)
@@ -264,7 +273,12 @@ fn render_entry_list(frame: &mut Frame, area: Rect, b: &BrowserState) {
 
     let entries = b.feed.as_ref().map(|f| f.entries.as_slice()).unwrap_or(&[]);
     if entries.is_empty() {
-        let p = Paragraph::new("\n  (empty feed)").block(block);
+        let msg = match &b.backend {
+            Backend::Library(lib) if lib.query.is_some() => "\n  No books match your search.",
+            Backend::Library(_) => "\n  No downloaded books yet.\n\n  Browse a catalog and press Enter on a book to download it.",
+            Backend::Opds(_) => "\n  (empty feed)",
+        };
+        let p = Paragraph::new(msg).wrap(Wrap { trim: false }).block(block);
         frame.render_widget(p, area);
         return;
     }
@@ -632,14 +646,23 @@ fn render_detail_formats(
 
 // --- Popups --------------------------------------------------------------
 
-fn render_confirm_delete(frame: &mut Frame, area: Rect, app: &App, id: u64) {
-    let name = app
-        .config
-        .feeds
-        .iter()
-        .find(|f| f.id == id)
-        .map(|f| f.name.clone())
-        .unwrap_or_default();
+fn render_confirm_delete(frame: &mut Frame, area: Rect, app: &App, confirm: &Confirm) {
+    let (title, name) = match confirm {
+        Confirm::DeleteFeed(id) => {
+            let name = app
+                .config
+                .feeds
+                .iter()
+                .find(|f| f.id == *id)
+                .map(|f| f.name.clone())
+                .unwrap_or_default();
+            (" Delete feed ", name)
+        }
+        Confirm::DeleteBook(i) => {
+            let name = library_book_title(app, *i).unwrap_or_default();
+            (" Delete book ", name)
+        }
+    };
 
     let popup = centered_rect(50, 7, area);
     frame.render_widget(Clear, popup);
@@ -647,7 +670,7 @@ fn render_confirm_delete(frame: &mut Frame, area: Rect, app: &App, id: u64) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Red))
-        .title(" Delete feed ");
+        .title(title);
     let text = Paragraph::new(vec![
         Line::from(""),
         Line::from(format!("  Delete \"{name}\"?")),
@@ -663,12 +686,28 @@ fn render_confirm_delete(frame: &mut Frame, area: Rect, app: &App, id: u64) {
 
 // --- Helpers -------------------------------------------------------------
 
+/// Title of the library book at `shown` index `i` in the open browser, if any.
+fn library_book_title(app: &App, i: usize) -> Option<String> {
+    let Screen::Browser(b) = &app.screen else { return None };
+    let Backend::Library(lib) = &b.backend else { return None };
+    let &book_idx = lib.shown.get(i)?;
+    Some(lib.books.get(book_idx)?.meta.title.clone())
+}
+
 fn crumb_path(b: &BrowserState) -> String {
-    let depth = b.stack.len();
-    if depth == 0 {
-        b.current_title.clone()
-    } else {
-        format!("{}  (depth {depth})", b.current_title)
+    match &b.backend {
+        Backend::Opds(o) => {
+            let depth = o.stack.len();
+            if depth == 0 {
+                b.title.clone()
+            } else {
+                format!("{}  (depth {depth})", b.title)
+            }
+        }
+        Backend::Library(lib) => match &lib.query {
+            Some(q) => format!("{} (filter: {q})", b.title),
+            None => b.title.clone(),
+        },
     }
 }
 

@@ -10,7 +10,7 @@ use ratatui_image::protocol::StatefulProtocol;
 
 use crate::opds::{Entry, Feed};
 use crate::reading::ReadingStats;
-use crate::storage::{Config, Feed as FeedConfig};
+use crate::storage::{Config, Feed as FeedConfig, LibraryBook, LibraryEntry};
 use crate::worker::{Request, Response};
 
 type Auth = Option<(String, String)>;
@@ -67,25 +67,85 @@ pub struct DetailState {
     pub format: usize,
 }
 
-/// State while browsing a single OPDS catalog.
-pub struct BrowserState {
+/// Backend-specific state for a browse session.
+///
+/// The shared list/detail/search rendering operates on [`BrowserState`]'s
+/// `feed`/`list`/`detail` regardless of where the entries came from; this enum
+/// is the swappable *back end* — a remote OPDS catalog or the local library.
+pub enum Backend {
+    Opds(OpdsBackend),
+    Library(LibraryBackend),
+}
+
+/// Back-end state for browsing a remote OPDS catalog.
+pub struct OpdsBackend {
     pub auth: Auth,
     pub stack: Vec<Crumb>,
+    pub current_url: String,
+    /// OpenSearch description URL advertised by a feed we've visited, if any.
+    pub search_url: Option<String>,
+    /// The query of an in-flight search, used to drop stale search responses.
+    pub pending_search: Option<String>,
+}
+
+/// Back-end state for browsing the local downloaded-book library.
+pub struct LibraryBackend {
+    /// All downloaded books, unfiltered.
+    pub books: Vec<LibraryBook>,
+    /// Indices into `books` currently shown (after any search filter).
+    pub shown: Vec<usize>,
+    /// The active filter query, if the list is filtered.
+    pub query: Option<String>,
+}
+
+impl LibraryBackend {
+    /// Recompute `shown` for the given filter (`None` shows everything).
+    fn apply_filter(&mut self, query: Option<String>) {
+        self.shown = match &query {
+            None => (0..self.books.len()).collect(),
+            Some(q) => {
+                let q = q.to_lowercase();
+                (0..self.books.len())
+                    .filter(|&i| book_matches(&self.books[i], &q))
+                    .collect()
+            }
+        };
+        self.query = query;
+    }
+
+    /// Build the display feed (cloned entries) for the current `shown` set.
+    fn build_feed(&self, title: &str) -> Feed {
+        Feed {
+            title: title.to_string(),
+            entries: self.shown.iter().map(|&i| self.books[i].entry.clone()).collect(),
+            links: Vec::new(),
+        }
+    }
+}
+
+/// Whether a library book matches a (lowercased) search query.
+fn book_matches(book: &LibraryBook, q: &str) -> bool {
+    let e = &book.entry;
+    e.title.to_lowercase().contains(q)
+        || e.authors.iter().any(|a| a.to_lowercase().contains(q))
+        || e.subjects().any(|s| s.to_lowercase().contains(q))
+        || e.genres().any(|s| s.to_lowercase().contains(q))
+}
+
+/// State while browsing a single catalog or the local library.
+pub struct BrowserState {
+    /// The data source backing this session.
+    pub backend: Backend,
     pub feed: Option<Feed>,
     pub list: ListState,
     pub loading: bool,
     pub error: Option<String>,
-    pub current_url: String,
-    pub current_title: String,
+    /// Title of the current location/collection.
+    pub title: String,
     /// When `Some`, the full-page detail view for a publication is open.
     pub detail: Option<DetailState>,
-    /// OpenSearch description URL advertised by a feed we've visited, if any.
-    /// Remembered across navigation so search stays available while browsing.
-    pub search_url: Option<String>,
     /// When `Some`, the search input box is open; holds the query being typed.
     pub search_query: Option<String>,
-    /// The query of an in-flight search, used to drop stale search responses.
-    pending_search: Option<String>,
     /// Selection index to restore once the in-flight feed finishes loading.
     restore_select: Option<usize>,
 }
@@ -102,9 +162,17 @@ impl BrowserState {
         let detail = self.detail.as_ref()?;
         self.feed.as_ref()?.entries.get(detail.entry_index)
     }
+
+    /// HTTP credentials for this session (none for the local library).
+    fn auth(&self) -> Auth {
+        match &self.backend {
+            Backend::Opds(o) => o.auth.clone(),
+            Backend::Library(_) => None,
+        }
+    }
 }
 
-/// Loaded state of a cover image, keyed by image URL.
+/// Loaded state of a cover image, keyed by image URL (or local file path).
 pub enum ImageSlot {
     Loading,
     Ready(Box<StatefulProtocol>),
@@ -127,6 +195,14 @@ pub enum ReadingSlot {
     Unavailable,
 }
 
+/// A pending confirmation prompt.
+pub enum Confirm {
+    /// Delete a saved feed (by id).
+    DeleteFeed(u64),
+    /// Delete a downloaded book (by index into the library's `shown` list).
+    DeleteBook(usize),
+}
+
 /// Which screen the UI is showing.
 pub enum Screen {
     FeedList,
@@ -138,8 +214,8 @@ pub struct App {
     pub config: Config,
     pub screen: Screen,
     pub feed_list: ListState,
-    /// Feed id pending delete-confirmation, if the confirm popup is open.
-    pub confirm_delete: Option<u64>,
+    /// A pending confirmation popup (delete feed / delete book), if open.
+    pub confirm: Option<Confirm>,
     pub status: String,
     pub should_quit: bool,
     /// Outgoing network requests, drained by the main loop after each update.
@@ -155,14 +231,13 @@ pub struct App {
 impl App {
     pub fn new(config: Config, picker: Picker) -> Self {
         let mut feed_list = ListState::default();
-        if !config.feeds.is_empty() {
-            feed_list.select(Some(0));
-        }
+        // Row 0 is always the pinned "Downloaded books" library entry.
+        feed_list.select(Some(0));
         App {
             config,
             screen: Screen::FeedList,
             feed_list,
-            confirm_delete: None,
+            confirm: None,
             status: String::new(),
             should_quit: false,
             outbox: Vec::new(),
@@ -177,7 +252,7 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         // A popup confirmation intercepts all keys.
-        if self.confirm_delete.is_some() {
+        if self.confirm.is_some() {
             self.handle_confirm_key(key);
             return;
         }
@@ -189,25 +264,30 @@ impl App {
     }
 
     fn handle_confirm_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(id) = self.confirm_delete.take() {
-                    self.config.remove(id);
-                    let _ = self.config.save();
-                    let len = self.config.feeds.len();
-                    fix_selection(&mut self.feed_list, len);
-                    self.status = "Feed deleted".into();
-                }
+        let confirm = self.confirm.take();
+        // Any key other than 'y' simply dismisses the prompt.
+        if !matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            return;
+        }
+        match confirm {
+            Some(Confirm::DeleteFeed(id)) => {
+                self.config.remove(id);
+                let _ = self.config.save();
+                let len = 1 + self.config.feeds.len();
+                fix_selection(&mut self.feed_list, len);
+                self.status = "Feed deleted".into();
             }
-            _ => self.confirm_delete = None,
+            Some(Confirm::DeleteBook(i)) => self.delete_book(i),
+            None => {}
         }
     }
 
     fn handle_feed_list_key(&mut self, key: KeyEvent) {
+        let len = 1 + self.config.feeds.len();
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Char('j') | KeyCode::Down => move_sel(&mut self.feed_list, self.config.feeds.len(), 1),
-            KeyCode::Char('k') | KeyCode::Up => move_sel(&mut self.feed_list, self.config.feeds.len(), -1),
+            KeyCode::Char('j') | KeyCode::Down => move_sel(&mut self.feed_list, len, 1),
+            KeyCode::Char('k') | KeyCode::Up => move_sel(&mut self.feed_list, len, -1),
             KeyCode::Char('n') => {
                 self.screen = Screen::Form(FormState::empty());
             }
@@ -218,10 +298,10 @@ impl App {
             }
             KeyCode::Char('d') => {
                 if let Some(feed) = self.selected_config_feed() {
-                    self.confirm_delete = Some(feed.id);
+                    self.confirm = Some(Confirm::DeleteFeed(feed.id));
                 }
             }
-            KeyCode::Enter | KeyCode::Char('l') => self.open_selected_feed(),
+            KeyCode::Enter | KeyCode::Char('l') => self.open_selected(),
             _ => {}
         }
     }
@@ -279,15 +359,19 @@ impl App {
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.follow_selected(),
             KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => self.go_back(),
             KeyCode::Char('n') => self.next_page(),
+            KeyCode::Char('d') => self.confirm_delete_selected_book(),
             KeyCode::Char('/') => self.open_search(),
             _ => {}
         }
     }
 
-    /// Open the search input box, if the current catalog advertises search.
+    /// Open the search input box. OPDS catalogs must advertise search; the
+    /// local library always supports it (an in-memory filter).
     fn open_search(&mut self) {
         let Screen::Browser(b) = &mut self.screen else { return };
-        if b.search_url.is_none() {
+        if let Backend::Opds(o) = &b.backend
+            && o.search_url.is_none()
+        {
             self.status = "This catalog doesn't support search".into();
             return;
         }
@@ -314,39 +398,57 @@ impl App {
         }
     }
 
-    /// Submit the typed query as a new search, pushing the result onto the stack.
+    /// Submit the typed query: an OPDS search (async) or a library filter.
     fn submit_search(&mut self) {
         let Screen::Browser(b) = &mut self.screen else { return };
         let query = b.search_query.take().unwrap_or_default().trim().to_string();
-        if query.is_empty() {
-            return;
+        match &mut b.backend {
+            Backend::Library(lib) => {
+                let filter = if query.is_empty() { None } else { Some(query) };
+                lib.apply_filter(filter);
+                let feed = lib.build_feed(&b.title);
+                let len = feed.entries.len();
+                b.feed = Some(feed);
+                b.list.select(if len == 0 { None } else { Some(0) });
+                self.request_selected_image();
+            }
+            Backend::Opds(o) => {
+                if query.is_empty() {
+                    return;
+                }
+                let Some(desc_url) = o.search_url.clone() else {
+                    self.status = "This catalog doesn't support search".into();
+                    return;
+                };
+                let auth = o.auth.clone();
+                o.stack.push(Crumb {
+                    url: o.current_url.clone(),
+                    title: b.title.clone(),
+                    selected: b.list.selected().unwrap_or(0),
+                });
+                // The real feed URL is unknown until the worker resolves the
+                // template; blanking it drops any in-flight plain-feed response.
+                o.current_url = String::new();
+                o.pending_search = Some(query.clone());
+                b.title = format!("Search: {query}");
+                b.loading = true;
+                b.error = None;
+                b.feed = None;
+                b.restore_select = Some(0);
+                self.outbox.push(Request::Search { desc_url, query, auth });
+            }
         }
-        let Some(desc_url) = b.search_url.clone() else {
-            self.status = "This catalog doesn't support search".into();
-            return;
-        };
-        let auth = b.auth.clone();
-        b.stack.push(Crumb {
-            url: b.current_url.clone(),
-            title: b.current_title.clone(),
-            selected: b.list.selected().unwrap_or(0),
-        });
-        // The real feed URL is unknown until the worker resolves the template;
-        // blanking it drops any in-flight plain-feed response in the meantime.
-        b.current_url = String::new();
-        b.current_title = format!("Search: {query}");
-        b.loading = true;
-        b.error = None;
-        b.feed = None;
-        b.restore_select = Some(0);
-        b.pending_search = Some(query.clone());
-        self.outbox.push(Request::Search { desc_url, query, auth });
     }
 
     // --- Feed list actions ------------------------------------------------
 
+    /// The saved feed under the cursor, or `None` on the pinned library row.
     fn selected_config_feed(&self) -> Option<&FeedConfig> {
-        self.config.feeds.get(self.feed_list.selected()?)
+        let sel = self.feed_list.selected()?;
+        if sel == 0 {
+            return None;
+        }
+        self.config.feeds.get(sel - 1)
     }
 
     fn submit_form(&mut self) {
@@ -380,36 +482,64 @@ impl App {
         } else {
             self.status = "Feed saved".into();
         }
-        if self.feed_list.selected().is_none() && !self.config.feeds.is_empty() {
-            self.feed_list.select(Some(0));
-        }
         self.screen = Screen::FeedList;
     }
 
-    fn open_selected_feed(&mut self) {
-        let Some(feed) = self.selected_config_feed() else { return };
+    /// Open whatever the cursor is on: the library (row 0) or a saved feed.
+    fn open_selected(&mut self) {
+        let sel = self.feed_list.selected().unwrap_or(0);
+        if sel == 0 {
+            self.open_library();
+            return;
+        }
+        let Some(feed) = self.config.feeds.get(sel - 1) else { return };
         let auth = feed.auth();
         let url = feed.url.clone();
         let title = feed.name.clone();
         let mut list = ListState::default();
         list.select(Some(0));
         let browser = BrowserState {
-            auth: auth.clone(),
-            stack: Vec::new(),
+            backend: Backend::Opds(OpdsBackend {
+                auth: auth.clone(),
+                stack: Vec::new(),
+                current_url: url.clone(),
+                search_url: None,
+                pending_search: None,
+            }),
             feed: None,
             list,
             loading: true,
             error: None,
-            current_url: url.clone(),
-            current_title: title,
+            title,
             detail: None,
-            search_url: None,
             search_query: None,
-            pending_search: None,
             restore_select: None,
         };
         self.screen = Screen::Browser(Box::new(browser));
         self.outbox.push(Request::Feed { url, auth });
+    }
+
+    /// Open the local downloaded-book library.
+    fn open_library(&mut self) {
+        let mut list = ListState::default();
+        list.select(Some(0));
+        let browser = BrowserState {
+            backend: Backend::Library(LibraryBackend {
+                books: Vec::new(),
+                shown: Vec::new(),
+                query: None,
+            }),
+            feed: None,
+            list,
+            loading: true,
+            error: None,
+            title: "Downloaded books".to_string(),
+            detail: None,
+            search_query: None,
+            restore_select: None,
+        };
+        self.screen = Screen::Browser(Box::new(browser));
+        self.outbox.push(Request::Library);
     }
 
     // --- Browser navigation ----------------------------------------------
@@ -417,19 +547,22 @@ impl App {
     fn follow_selected(&mut self) {
         let Screen::Browser(b) = &mut self.screen else { return };
         let Some(entry) = b.selected_entry() else { return };
-        let Some(link) = entry.nav_link() else {
-            // A publication entry: open its detail / download view instead.
-            if entry.acquisition_links().next().is_some() {
-                // Read everything off `entry` before mutating `b` (entry borrows b).
-                let entry_index = b.list.selected().unwrap_or(0);
-                let web_url = entry.web_link().map(|l| l.href.clone());
+        // Read everything off `entry` before mutating `b` (entry borrows b).
+        let entry_index = b.list.selected().unwrap_or(0);
+        let nav = entry.nav_link().map(|l| (l.href.clone(), entry.title.clone()));
+        let has_acquisition = entry.acquisition_links().next().is_some();
+        let web_url = entry.web_link().map(|l| l.href.clone());
+
+        // A publication entry: open its detail / download view.
+        if nav.is_none() {
+            if has_acquisition {
                 b.detail = Some(DetailState { entry_index, format: 0 });
-                // Lazily fetch reading metrics from the publication's web page.
-                // (self.reading/outbox are fields disjoint from self.screen.)
+                // Lazily fetch reading metrics from the publication's web page
+                // (unless already loaded — library books seed them from disk).
                 if let Some(url) = web_url
                     && !self.reading.contains_key(&url)
                 {
-                    let auth = b.auth.clone();
+                    let auth = b.auth();
                     self.reading.insert(url.clone(), ReadingSlot::Loading);
                     self.outbox.push(Request::Reading { url, auth });
                 }
@@ -437,22 +570,24 @@ impl App {
                 self.status = "No catalog link or downloads for this entry".into();
             }
             return;
-        };
-        let next_url = link.href.clone();
-        let next_title = entry.title.clone();
-        b.stack.push(Crumb {
-            url: b.current_url.clone(),
-            title: b.current_title.clone(),
+        }
+
+        // A navigation entry: load the linked sub-catalog (OPDS only).
+        let Some((next_url, next_title)) = nav else { return };
+        let Backend::Opds(o) = &mut b.backend else { return };
+        o.stack.push(Crumb {
+            url: o.current_url.clone(),
+            title: b.title.clone(),
             selected: b.list.selected().unwrap_or(0),
         });
-        let auth = b.auth.clone();
-        b.current_url = next_url.clone();
-        b.current_title = next_title;
+        let auth = o.auth.clone();
+        o.current_url = next_url.clone();
+        o.pending_search = None;
+        b.title = next_title;
         b.loading = true;
         b.error = None;
         b.feed = None;
         b.restore_select = Some(0);
-        b.pending_search = None;
         self.outbox.push(Request::Feed { url: next_url, auth });
     }
 
@@ -481,47 +616,137 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 detail.format = detail.format.saturating_sub(1);
             }
-            KeyCode::Enter | KeyCode::Char('d') => self.download_selected_format(),
+            KeyCode::Enter | KeyCode::Char('d') | KeyCode::Char('o') => {
+                self.activate_selected_format()
+            }
             _ => {}
         }
     }
 
-    /// Queue a download of the format highlighted in the detail view.
+    /// Act on the highlighted format: download it (OPDS) or open it (library).
+    fn activate_selected_format(&mut self) {
+        let is_library = matches!(
+            &self.screen,
+            Screen::Browser(b) if matches!(b.backend, Backend::Library(_))
+        );
+        if is_library {
+            self.open_selected_format();
+        } else {
+            self.download_selected_format();
+        }
+    }
+
+    /// Queue a download of the format highlighted in the detail view, carrying
+    /// the metadata the worker needs to persist a library sidecar.
     fn download_selected_format(&mut self) {
-        let Some((url, auth)) = self.selected_format_target() else {
+        let Screen::Browser(b) = &self.screen else { return };
+        let Some(detail) = b.detail.as_ref() else { return };
+        let Some(entry) = b.feed.as_ref().and_then(|f| f.entries.get(detail.entry_index)) else {
             return;
         };
+        let Some(link) = entry.acquisition_links().nth(detail.format) else { return };
+        let url = link.href.clone();
         // Don't re-queue a download that's already running.
         if matches!(self.downloads.get(&url), Some(DownloadSlot::Pending)) {
             self.status = "Already downloading…".into();
             return;
         }
+        let mime = link.mime.clone();
+        let length = link.length;
+        let cover_url = entry.image_link().map(|l| l.href.clone());
+        let mut meta = LibraryEntry::from_entry(entry);
+        // Attach scraped reading metrics if we have them on hand.
+        if let Some(web) = entry.web_link()
+            && let Some(ReadingSlot::Ready(stats)) = self.reading.get(&web.href)
+        {
+            meta.reading = Some(stats.clone());
+        }
+        let auth = b.auth();
         self.downloads.insert(url.clone(), DownloadSlot::Pending);
         self.status = "Downloading…".into();
-        self.outbox.push(Request::Download { url, auth });
+        self.outbox.push(Request::Download {
+            meta: Box::new(meta),
+            url,
+            mime,
+            length,
+            cover_url,
+            auth,
+        });
     }
 
-    /// The `(url, auth)` of the acquisition link selected in the detail view.
-    fn selected_format_target(&self) -> Option<(String, Auth)> {
-        let Screen::Browser(b) = &self.screen else { return None };
-        let detail = b.detail.as_ref()?;
-        let entry = b.feed.as_ref()?.entries.get(detail.entry_index)?;
-        let link = entry.acquisition_links().nth(detail.format)?;
-        Some((link.href.clone(), b.auth.clone()))
+    /// Open the highlighted local format in the OS default reader.
+    fn open_selected_format(&mut self) {
+        let Screen::Browser(b) = &self.screen else { return };
+        let Some(detail) = b.detail.as_ref() else { return };
+        let Some(entry) = b.feed.as_ref().and_then(|f| f.entries.get(detail.entry_index)) else {
+            return;
+        };
+        let Some(link) = entry.acquisition_links().nth(detail.format) else { return };
+        let path = PathBuf::from(&link.href);
+        match crate::storage::open_in_reader(&path) {
+            Ok(()) => self.status = format!("Opened {}", path.display()),
+            Err(e) => self.status = format!("Open failed: {e:#}"),
+        }
+    }
+
+    /// Open a delete-confirmation for the highlighted library book.
+    fn confirm_delete_selected_book(&mut self) {
+        let Screen::Browser(b) = &self.screen else { return };
+        if !matches!(b.backend, Backend::Library(_)) {
+            return;
+        }
+        if let Some(sel) = b.list.selected() {
+            self.confirm = Some(Confirm::DeleteBook(sel));
+        }
+    }
+
+    /// Delete the library book at `shown` index `shown_idx` (files + sidecar).
+    fn delete_book(&mut self, shown_idx: usize) {
+        let Screen::Browser(b) = &mut self.screen else { return };
+        let Backend::Library(lib) = &mut b.backend else { return };
+        let Some(&book_idx) = lib.shown.get(shown_idx) else { return };
+        let id = lib.books[book_idx].id.clone();
+        if let Err(e) = crate::storage::delete_book(&id) {
+            self.status = format!("Delete failed: {e:#}");
+            return;
+        }
+        lib.books.remove(book_idx);
+        let query = lib.query.clone();
+        lib.apply_filter(query);
+        let feed = lib.build_feed(&b.title);
+        let len = feed.entries.len();
+        b.feed = Some(feed);
+        fix_selection(&mut b.list, len);
+        self.status = "Book deleted".into();
     }
 
     fn go_back(&mut self) {
         let Screen::Browser(b) = &mut self.screen else { return };
-        match b.stack.pop() {
+        // Library: clear an active filter first; otherwise leave to the feeds.
+        if let Backend::Library(lib) = &mut b.backend {
+            if lib.query.is_some() {
+                lib.apply_filter(None);
+                let feed = lib.build_feed(&b.title);
+                let len = feed.entries.len();
+                b.feed = Some(feed);
+                b.list.select(if len == 0 { None } else { Some(0) });
+            } else {
+                self.screen = Screen::FeedList;
+            }
+            return;
+        }
+
+        let Backend::Opds(o) = &mut b.backend else { return };
+        match o.stack.pop() {
             Some(crumb) => {
-                let auth = b.auth.clone();
-                b.current_url = crumb.url.clone();
-                b.current_title = crumb.title;
+                let auth = o.auth.clone();
+                o.current_url = crumb.url.clone();
+                o.pending_search = None;
+                b.title = crumb.title;
                 b.loading = true;
                 b.error = None;
                 b.feed = None;
                 b.restore_select = Some(crumb.selected);
-                b.pending_search = None;
                 self.outbox.push(Request::Feed { url: crumb.url, auth });
             }
             None => self.screen = Screen::FeedList,
@@ -530,24 +755,27 @@ impl App {
 
     fn next_page(&mut self) {
         let Screen::Browser(b) = &mut self.screen else { return };
-        let Some(feed) = &b.feed else { return };
-        let Some(next) = feed.next_link() else {
+        let Backend::Opds(o) = &mut b.backend else {
+            self.status = "No further pages".into();
+            return;
+        };
+        let Some(next) = b.feed.as_ref().and_then(|f| f.next_link()) else {
             self.status = "No further pages".into();
             return;
         };
         let next_url = next.href.clone();
-        b.stack.push(Crumb {
-            url: b.current_url.clone(),
-            title: b.current_title.clone(),
+        o.stack.push(Crumb {
+            url: o.current_url.clone(),
+            title: b.title.clone(),
             selected: b.list.selected().unwrap_or(0),
         });
-        let auth = b.auth.clone();
-        b.current_url = next_url.clone();
+        let auth = o.auth.clone();
+        o.current_url = next_url.clone();
+        o.pending_search = None;
         b.loading = true;
         b.error = None;
         b.feed = None;
         b.restore_select = Some(0);
-        b.pending_search = None;
         self.outbox.push(Request::Feed { url: next_url, auth });
     }
 
@@ -560,7 +788,7 @@ impl App {
         if self.images.contains_key(&url) {
             return;
         }
-        let auth = b.auth.clone();
+        let auth = b.auth();
         self.images.insert(url.clone(), ImageSlot::Loading);
         self.outbox.push(Request::Image { url, auth });
     }
@@ -599,22 +827,54 @@ impl App {
                 };
                 self.reading.insert(url, slot);
             }
+            Response::Library { result } => self.on_library(result),
+        }
+    }
+
+    fn on_library(&mut self, result: anyhow::Result<Vec<LibraryBook>>) {
+        let Screen::Browser(b) = &mut self.screen else { return };
+        let Backend::Library(lib) = &mut b.backend else { return };
+        b.loading = false;
+        match result {
+            Ok(books) => {
+                // Seed cached reading metrics so the detail page needs no network.
+                for book in &books {
+                    if let (Some(web), Some(stats)) = (&book.meta.web_url, &book.meta.reading) {
+                        self.reading
+                            .entry(web.clone())
+                            .or_insert_with(|| ReadingSlot::Ready(stats.clone()));
+                    }
+                }
+                lib.books = books;
+                lib.apply_filter(None);
+                let feed = lib.build_feed(&b.title);
+                let len = feed.entries.len();
+                b.list.select(if len == 0 { None } else { Some(0) });
+                b.feed = Some(feed);
+                b.error = None;
+                self.request_selected_image();
+            }
+            Err(e) => {
+                b.feed = None;
+                b.error = Some(format!("{e:#}"));
+            }
         }
     }
 
     fn on_search(&mut self, query: String, result: anyhow::Result<(String, Feed)>) {
         let Screen::Browser(b) = &mut self.screen else { return };
+        let Backend::Opds(o) = &mut b.backend else { return };
         // Ignore results for a search the user has since abandoned.
-        if b.pending_search.as_deref() != Some(query.as_str()) {
+        if o.pending_search.as_deref() != Some(query.as_str()) {
             return;
         }
-        b.pending_search = None;
+        o.pending_search = None;
         b.loading = false;
         match result {
             Ok((url, feed)) => {
-                b.current_url = url;
+                o.current_url = url;
                 if let Some(s) = feed.search_link() {
-                    b.search_url = Some(s.href.clone());
+                    o.search_url = Some(s.href.clone());
                 }
                 let len = feed.entries.len();
                 let sel = b.restore_select.take().unwrap_or(0).min(len.saturating_sub(1));
@@ -632,19 +892,20 @@ impl App {
 
     fn on_feed(&mut self, url: String, result: anyhow::Result<Feed>) {
         let Screen::Browser(b) = &mut self.screen else { return };
+        let Backend::Opds(o) = &mut b.backend else { return };
         // Ignore responses for feeds we've already navigated away from.
-        if b.current_url != url {
+        if o.current_url != url {
             return;
         }
         b.loading = false;
         match result {
             Ok(feed) => {
-                if b.current_title.is_empty() {
-                    b.current_title = feed.title.clone();
+                if b.title.is_empty() {
+                    b.title = feed.title.clone();
                 }
                 // Remember the catalog's search endpoint so `/` works from here on.
                 if let Some(s) = feed.search_link() {
-                    b.search_url = Some(s.href.clone());
+                    o.search_url = Some(s.href.clone());
                 }
                 let len = feed.entries.len();
                 let sel = b.restore_select.take().unwrap_or(0).min(len.saturating_sub(1));
@@ -686,4 +947,65 @@ fn fix_selection(state: &mut ListState, len: usize) {
 pub fn is_ctrl_c(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn book(id: &str, title: &str, author: &str) -> LibraryBook {
+        let entry = Entry {
+            title: title.to_string(),
+            authors: vec![author.to_string()],
+            ..Default::default()
+        };
+        LibraryBook {
+            id: id.to_string(),
+            entry,
+            meta: LibraryEntry::default(),
+        }
+    }
+
+    fn library(books: Vec<LibraryBook>) -> LibraryBackend {
+        let mut lib = LibraryBackend { books, shown: Vec::new(), query: None };
+        lib.apply_filter(None);
+        lib
+    }
+
+    #[test]
+    fn filter_matches_title_and_author_case_insensitively() {
+        let mut lib = library(vec![
+            book("a", "The Professor's House", "Willa Cather"),
+            book("b", "My Antonia", "Willa Cather"),
+            book("c", "Moby Dick", "Herman Melville"),
+        ]);
+        assert_eq!(lib.shown.len(), 3);
+
+        // Matches a title fragment, ignoring case.
+        lib.apply_filter(Some("moby".to_string()));
+        assert_eq!(lib.shown, vec![2]);
+
+        // Matches an author across multiple books.
+        lib.apply_filter(Some("cather".to_string()));
+        assert_eq!(lib.shown, vec![0, 1]);
+
+        // Clearing the filter restores everything.
+        lib.apply_filter(None);
+        assert_eq!(lib.shown.len(), 3);
+    }
+
+    #[test]
+    fn build_feed_reflects_filtered_selection() {
+        let lib = {
+            let mut lib = library(vec![
+                book("a", "Alpha", "Author One"),
+                book("b", "Beta", "Author Two"),
+            ]);
+            lib.apply_filter(Some("beta".to_string()));
+            lib
+        };
+        let feed = lib.build_feed("Downloaded books");
+        assert_eq!(feed.entries.len(), 1);
+        assert_eq!(feed.entries[0].title, "Beta");
+    }
 }

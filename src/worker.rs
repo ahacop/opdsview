@@ -14,7 +14,7 @@ use image::DynamicImage;
 use crate::cache::Cache;
 use crate::opds::Feed;
 use crate::reading::{extract_reading_text, ReadingStats};
-use crate::storage::download_dir;
+use crate::storage::{self, LibraryBook, LibraryEntry};
 
 /// How long a cached feed response is considered fresh.
 const FEED_TTL: Duration = Duration::from_secs(15 * 60);
@@ -27,8 +27,18 @@ pub enum Request {
     Feed { url: String, auth: Auth },
     /// Fetch and decode a cover image, keyed by its URL.
     Image { url: String, auth: Auth },
-    /// Download a book to disk, keyed by its acquisition URL.
-    Download { url: String, auth: Auth },
+    /// Download a book to the library, persisting a metadata sidecar. `url` is
+    /// the chosen acquisition link (and the key the UI tracks progress under).
+    Download {
+        meta: Box<LibraryEntry>,
+        url: String,
+        mime: String,
+        length: Option<u64>,
+        cover_url: Option<String>,
+        auth: Auth,
+    },
+    /// Load all downloaded books from the local library.
+    Library,
     /// Run an OpenSearch query: resolve the description at `desc_url`, then
     /// fetch the resulting acquisition feed.
     Search { desc_url: String, query: String, auth: Auth },
@@ -42,6 +52,7 @@ pub enum Response {
     Feed { url: String, result: Result<Feed> },
     Image { url: String, result: Result<DynamicImage> },
     Download { url: String, result: Result<PathBuf> },
+    Library { result: Result<Vec<LibraryBook>> },
     /// A search result: the resolved feed URL and its parsed feed.
     Search { query: String, result: Result<(String, Feed)> },
     Reading { url: String, result: Result<ReadingStats> },
@@ -75,9 +86,15 @@ impl Worker {
                         let result = fetch_image(&http, &cache, &url, &auth);
                         let _ = resp_tx.send(Response::Image { url, result });
                     }
-                    Request::Download { url, auth } => {
-                        let result = download_book(&http, &url, &auth);
+                    Request::Download { meta, url, mime, length, cover_url, auth } => {
+                        let result = download_book(
+                            &http, &cache, *meta, &url, &mime, length, cover_url.as_deref(), &auth,
+                        );
                         let _ = resp_tx.send(Response::Download { url, result });
+                    }
+                    Request::Library => {
+                        let result = storage::load_library();
+                        let _ = resp_tx.send(Response::Library { result });
                     }
                     Request::Search { desc_url, query, auth } => {
                         let result = search(&http, &cache, &desc_url, &query, &auth);
@@ -139,18 +156,38 @@ fn fetch_image(
     url: &str,
     auth: &Auth,
 ) -> Result<DynamicImage> {
-    // Images are immutable content; cache them indefinitely.
-    let bytes = match cache.get(url, "img", None) {
-        Some(bytes) => bytes,
-        None => {
-            let bytes = get_bytes(http, url, auth)?;
-            let _ = cache.put(url, "img", &bytes);
-            bytes
-        }
-    };
+    let bytes = image_bytes(http, cache, url, auth)?;
     let img = image::load_from_memory(&bytes)
         .with_context(|| format!("decoding image {url}"))?;
     Ok(img)
+}
+
+/// Whether a link points at a local file rather than a remote resource.
+///
+/// Library entries carry absolute filesystem paths as their cover/format
+/// `href`s; everything fetched over the network is `http(s)`.
+fn is_local_path(url: &str) -> bool {
+    !url.starts_with("http://") && !url.starts_with("https://")
+}
+
+/// Load image bytes for a cover, from a local file, the cache, or the network.
+///
+/// Images are immutable content, so network fetches are cached indefinitely.
+fn image_bytes(
+    http: &reqwest::blocking::Client,
+    cache: &Cache,
+    url: &str,
+    auth: &Auth,
+) -> Result<Vec<u8>> {
+    if is_local_path(url) {
+        return std::fs::read(url).with_context(|| format!("reading cover {url}"));
+    }
+    if let Some(bytes) = cache.get(url, "img", None) {
+        return Ok(bytes);
+    }
+    let bytes = get_bytes(http, url, auth)?;
+    let _ = cache.put(url, "img", &bytes);
+    Ok(bytes)
 }
 
 /// Fetch a publication's web page and parse its reading metrics.
@@ -199,45 +236,23 @@ fn search(
     Ok((url, feed))
 }
 
-/// Download a book to the user's downloads directory and return its path.
-fn download_book(http: &reqwest::blocking::Client, url: &str, auth: &Auth) -> Result<PathBuf> {
-    let dir = download_dir().context("resolving downloads directory")?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating downloads directory {}", dir.display()))?;
+/// Download a book into the local library and return the saved ebook path.
+///
+/// Fetches the ebook and, the first time a book is saved, its cover (reusing
+/// any cached cover bytes from browsing). [`storage::save_book`] writes the
+/// files and the metadata sidecar.
+#[allow(clippy::too_many_arguments)]
+fn download_book(
+    http: &reqwest::blocking::Client,
+    cache: &Cache,
+    meta: LibraryEntry,
+    url: &str,
+    mime: &str,
+    length: Option<u64>,
+    cover_url: Option<&str>,
+    auth: &Auth,
+) -> Result<PathBuf> {
     let bytes = get_bytes(http, url, auth)?;
-    let path = dir.join(filename_from_url(url));
-    std::fs::write(&path, &bytes)
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
-}
-
-/// Derive a sensible filename from a download URL's last path segment.
-fn filename_from_url(url: &str) -> String {
-    let name = url::Url::parse(url)
-        .ok()
-        .and_then(|u| {
-            u.path_segments()
-                .and_then(|mut s| s.next_back())
-                .map(|s| s.to_string())
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "download".to_string());
-    // Strip any leftover query fragment and percent-decode nothing fancy.
-    name.split(['?', '#']).next().unwrap_or(&name).to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::filename_from_url;
-
-    #[test]
-    fn derives_filename_from_url() {
-        assert_eq!(
-            filename_from_url("https://se.org/a/b/cather_house.epub?source=feed"),
-            "cather_house.epub"
-        );
-        assert_eq!(filename_from_url("https://se.org/x.azw3"), "x.azw3");
-        // A URL with no usable last segment falls back to a default.
-        assert_eq!(filename_from_url("https://se.org/"), "download");
-    }
+    let cover_bytes = cover_url.and_then(|u| image_bytes(http, cache, u, auth).ok());
+    storage::save_book(meta, mime, length, url, &bytes, cover_bytes.as_deref())
 }

@@ -12,7 +12,7 @@
 //! on disk indefinitely (see [`crate::worker`]).
 
 /// Reading-length and difficulty metrics for a single publication.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ReadingStats {
     pub word_count: Option<u32>,
     pub reading_time: Option<String>,
