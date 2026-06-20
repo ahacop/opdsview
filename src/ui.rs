@@ -552,12 +552,6 @@ fn render_detail_info(
     }
     push_meta_lines(&mut lines, entry);
     push_reading_lines(&mut lines, reading);
-    if let Some(rights) = &entry.rights {
-        lines.push(Line::from(vec![
-            Span::styled("Rights: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(rights.clone()),
-        ]));
-    }
     if let Some(web) = entry.web_link() {
         lines.push(Line::from(vec![
             Span::styled("Web: ", Style::default().fg(Color::DarkGray)),
