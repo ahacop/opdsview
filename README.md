@@ -13,6 +13,8 @@ and have responses cached locally.
 - **Browse catalogs** — drill into navigation feeds, page through results, and
   inspect publications (authors, publication date, language, publisher, subjects,
   summary, and available formats).
+- **Search** — for catalogs that advertise OpenSearch (e.g. Standard Ebooks),
+  press `/` to run a full-text query and browse the results like any other feed.
 - **Publication detail & downloads** — press `Enter` on a book to open a full
   detail page with its cover, full description, metadata, and a list of
   downloadable formats (with file sizes). Pick a format and download it to your
@@ -59,6 +61,7 @@ A `nix develop` shell with the full toolchain is provided via `flake.nix`.
 | `g`/`G` | Jump to top/bottom |
 | `Enter`/`l`/`→` | Follow a navigation entry, or open a publication's detail page |
 | `Backspace`/`h`/`←` | Go back (or return to the feed list) |
+| `/` | Search the catalog (when supported); `Enter` runs it, `Esc` cancels |
 | `n` | Next page |
 | `q`/`Esc` | Return to the feed list |
 

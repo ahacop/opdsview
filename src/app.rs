@@ -78,6 +78,13 @@ pub struct BrowserState {
     pub current_title: String,
     /// When `Some`, the full-page detail view for a publication is open.
     pub detail: Option<DetailState>,
+    /// OpenSearch description URL advertised by a feed we've visited, if any.
+    /// Remembered across navigation so search stays available while browsing.
+    pub search_url: Option<String>,
+    /// When `Some`, the search input box is open; holds the query being typed.
+    pub search_query: Option<String>,
+    /// The query of an in-flight search, used to drop stale search responses.
+    pending_search: Option<String>,
     /// Selection index to restore once the in-flight feed finishes loading.
     restore_select: Option<usize>,
 }
@@ -114,7 +121,7 @@ pub enum DownloadSlot {
 pub enum Screen {
     FeedList,
     Form(FormState),
-    Browser(BrowserState),
+    Browser(Box<BrowserState>),
 }
 
 pub struct App {
@@ -222,6 +229,11 @@ impl App {
     }
 
     fn handle_browser_key(&mut self, key: KeyEvent) {
+        // The search input box captures all keys while open.
+        if matches!(&self.screen, Screen::Browser(b) if b.search_query.is_some()) {
+            self.handle_search_key(key);
+            return;
+        }
         // The detail ("show page") overlay captures all keys while open.
         if matches!(&self.screen, Screen::Browser(b) if b.detail.is_some()) {
             self.handle_detail_key(key);
@@ -254,8 +266,68 @@ impl App {
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.follow_selected(),
             KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => self.go_back(),
             KeyCode::Char('n') => self.next_page(),
+            KeyCode::Char('/') => self.open_search(),
             _ => {}
         }
+    }
+
+    /// Open the search input box, if the current catalog advertises search.
+    fn open_search(&mut self) {
+        let Screen::Browser(b) = &mut self.screen else { return };
+        if b.search_url.is_none() {
+            self.status = "This catalog doesn't support search".into();
+            return;
+        }
+        b.search_query = Some(String::new());
+    }
+
+    /// Key handling while the search input box is open.
+    fn handle_search_key(&mut self, key: KeyEvent) {
+        let Screen::Browser(b) = &mut self.screen else { return };
+        match key.code {
+            KeyCode::Esc => b.search_query = None,
+            KeyCode::Enter => self.submit_search(),
+            KeyCode::Backspace => {
+                if let Some(q) = b.search_query.as_mut() {
+                    q.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(q) = b.search_query.as_mut() {
+                    q.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Submit the typed query as a new search, pushing the result onto the stack.
+    fn submit_search(&mut self) {
+        let Screen::Browser(b) = &mut self.screen else { return };
+        let query = b.search_query.take().unwrap_or_default().trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        let Some(desc_url) = b.search_url.clone() else {
+            self.status = "This catalog doesn't support search".into();
+            return;
+        };
+        let auth = b.auth.clone();
+        b.stack.push(Crumb {
+            url: b.current_url.clone(),
+            title: b.current_title.clone(),
+            selected: b.list.selected().unwrap_or(0),
+        });
+        // The real feed URL is unknown until the worker resolves the template;
+        // blanking it drops any in-flight plain-feed response in the meantime.
+        b.current_url = String::new();
+        b.current_title = format!("Search: {query}");
+        b.loading = true;
+        b.error = None;
+        b.feed = None;
+        b.restore_select = Some(0);
+        b.pending_search = Some(query.clone());
+        self.outbox.push(Request::Search { desc_url, query, auth });
     }
 
     // --- Feed list actions ------------------------------------------------
@@ -318,9 +390,12 @@ impl App {
             current_url: url.clone(),
             current_title: title,
             detail: None,
+            search_url: None,
+            search_query: None,
+            pending_search: None,
             restore_select: None,
         };
-        self.screen = Screen::Browser(browser);
+        self.screen = Screen::Browser(Box::new(browser));
         self.outbox.push(Request::Feed { url, auth });
     }
 
@@ -353,6 +428,7 @@ impl App {
         b.error = None;
         b.feed = None;
         b.restore_select = Some(0);
+        b.pending_search = None;
         self.outbox.push(Request::Feed { url: next_url, auth });
     }
 
@@ -421,6 +497,7 @@ impl App {
                 b.error = None;
                 b.feed = None;
                 b.restore_select = Some(crumb.selected);
+                b.pending_search = None;
                 self.outbox.push(Request::Feed { url: crumb.url, auth });
             }
             None => self.screen = Screen::FeedList,
@@ -446,6 +523,7 @@ impl App {
         b.error = None;
         b.feed = None;
         b.restore_select = Some(0);
+        b.pending_search = None;
         self.outbox.push(Request::Feed { url: next_url, auth });
     }
 
@@ -489,6 +567,35 @@ impl App {
                 };
                 self.downloads.insert(url, slot);
             }
+            Response::Search { query, result } => self.on_search(query, result),
+        }
+    }
+
+    fn on_search(&mut self, query: String, result: anyhow::Result<(String, Feed)>) {
+        let Screen::Browser(b) = &mut self.screen else { return };
+        // Ignore results for a search the user has since abandoned.
+        if b.pending_search.as_deref() != Some(query.as_str()) {
+            return;
+        }
+        b.pending_search = None;
+        b.loading = false;
+        match result {
+            Ok((url, feed)) => {
+                b.current_url = url;
+                if let Some(s) = feed.search_link() {
+                    b.search_url = Some(s.href.clone());
+                }
+                let len = feed.entries.len();
+                let sel = b.restore_select.take().unwrap_or(0).min(len.saturating_sub(1));
+                b.list.select(if len == 0 { None } else { Some(sel) });
+                b.feed = Some(feed);
+                b.error = None;
+                self.request_selected_image();
+            }
+            Err(e) => {
+                b.feed = None;
+                b.error = Some(format!("{e:#}"));
+            }
         }
     }
 
@@ -503,6 +610,10 @@ impl App {
             Ok(feed) => {
                 if b.current_title.is_empty() {
                     b.current_title = feed.title.clone();
+                }
+                // Remember the catalog's search endpoint so `/` works from here on.
+                if let Some(s) = feed.search_link() {
+                    b.search_url = Some(s.href.clone());
                 }
                 let len = feed.entries.len();
                 let sel = b.restore_select.take().unwrap_or(0).min(len.saturating_sub(1));

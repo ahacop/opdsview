@@ -41,10 +41,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_help(frame, chunks[2], "Tab/↑↓ field   type to edit   Enter save   Esc cancel");
         }
         Screen::Browser(b) => {
-            let help = if b.detail.is_some() {
+            let help = if b.search_query.is_some() {
+                "type to search   Enter run   Esc cancel"
+            } else if b.detail.is_some() {
                 "↑↓ format   Enter/d download   ⌫/h/Esc back"
             } else {
-                "↑↓ move   Enter open   ⌫/h back   n next page   q feeds"
+                "↑↓ move   Enter open   / search   ⌫/h back   n next   q feeds"
             };
             render_browser(frame, chunks[1], &app.screen, &mut app.images, &app.downloads);
             render_help(frame, chunks[2], help);
@@ -56,9 +58,28 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_help(frame, chunks[2], &app.status);
     }
 
+    if let Screen::Browser(b) = &app.screen
+        && let Some(query) = &b.search_query
+    {
+        render_search_input(frame, area, query);
+    }
+
     if let Some(id) = app.confirm_delete {
         render_confirm_delete(frame, area, app, id);
     }
+}
+
+/// A centered one-line text input box for entering a search query.
+fn render_search_input(frame: &mut Frame, area: Rect, query: &str) {
+    let popup = centered_rect(60, 3, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" Search catalog ");
+    let p = Paragraph::new(Line::from(format!(" {query}█"))).block(block);
+    frame.render_widget(p, popup);
 }
 
 fn render_title_bar(frame: &mut Frame, area: Rect, screen: &Screen) {

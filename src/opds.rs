@@ -4,7 +4,7 @@
 //! acquisition feeds describe publications with download and cover links.
 
 use anyhow::{Context, Result};
-use url::Url;
+use url::{Url, form_urlencoded};
 
 /// OPDS link relation prefix marking an acquisition (downloadable) link.
 const REL_ACQUISITION: &str = "http://opds-spec.org/acquisition";
@@ -106,6 +106,14 @@ impl Feed {
         self.links.iter().find(|l| l.rel == "next")
     }
 
+    /// The `rel="search"` link advertising an OpenSearch description, if any.
+    ///
+    /// OPDS catalogs that support full-text search point here (OPDS 1.2 §4).
+    /// The href resolves to an OpenSearch description document, not a feed.
+    pub fn search_link(&self) -> Option<&Link> {
+        self.links.iter().find(|l| l.rel == "search")
+    }
+
     /// Parse a feed from XML, resolving relative links against `base_url`.
     pub fn parse(xml: &str, base_url: &str) -> Result<Feed> {
         let doc = roxmltree::Document::parse(xml).context("parsing OPDS XML")?;
@@ -142,6 +150,76 @@ impl Feed {
         }
         Ok(feed)
     }
+}
+
+/// Pick the best OPDS search-URL template from an OpenSearch description.
+///
+/// An OpenSearch description (OpenSearch 1.1) lists one or more `<Url>`
+/// templates, one per result format. We prefer an OPDS acquisition feed, then
+/// any Atom feed; templates we can't parse as a feed (HTML, RSS) rank lowest
+/// and the self-description link is skipped. Returns the chosen `template`
+/// attribute verbatim, with its `{placeholders}` still intact.
+pub fn opensearch_template(xml: &str) -> Option<String> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    let root = doc.root_element();
+    if !local_name_is(&root, "OpenSearchDescription") {
+        return None;
+    }
+    let mut best: Option<(u8, String)> = None;
+    for url in root
+        .children()
+        .filter(|n| n.is_element() && local_name(n) == "Url")
+    {
+        let Some(template) = url.attribute("template") else {
+            continue;
+        };
+        let mime = url.attribute("type").unwrap_or("");
+        // Skip the link that points back at the description document itself.
+        if mime.contains("opensearchdescription") {
+            continue;
+        }
+        let rank = if mime.contains("opds-catalog") {
+            3
+        } else if mime.contains("atom+xml") {
+            2
+        } else {
+            1
+        };
+        if best.as_ref().is_none_or(|(r, _)| rank > *r) {
+            best = Some((rank, template.to_string()));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+/// Fill an OpenSearch URL template with `query`, producing a fetchable URL.
+///
+/// `{searchTerms}` is replaced with the form-encoded query; every other
+/// `{placeholder}` (e.g. `{count}`, `{startPage}`) is dropped, letting the
+/// server apply its defaults.
+pub fn build_search_url(template: &str, query: &str) -> String {
+    let encoded: String = form_urlencoded::byte_serialize(query.as_bytes()).collect();
+    let replaced = template.replace("{searchTerms}", &encoded);
+    strip_placeholders(&replaced)
+}
+
+/// Remove any remaining `{...}` template placeholders from a string.
+fn strip_placeholders(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            // Skip through to the closing brace.
+            for c2 in chars.by_ref() {
+                if c2 == '}' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn parse_entry<F: Fn(&str) -> String>(node: &roxmltree::Node, resolve: &F) -> Entry {
@@ -382,5 +460,48 @@ mod tests {
     #[test]
     fn rejects_non_feed_xml() {
         assert!(Feed::parse("<html><body>nope</body></html>", "https://x/").is_err());
+    }
+
+    const OPENSEARCH: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+    <OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+      <Url type="application/opensearchdescription+xml" rel="self" template="https://e.org/opensearch"/>
+      <Url type="text/html" template="https://e.org/search?q={searchTerms}&amp;page={startPage}"/>
+      <Url type="application/atom+xml" template="https://e.org/atom?query={searchTerms}"/>
+      <Url type="application/atom+xml;profile=opds-catalog;kind=acquisition"
+           template="https://e.org/opds/all?query={searchTerms}&amp;per-page={count}&amp;page={startPage}"/>
+    </OpenSearchDescription>"#;
+
+    #[test]
+    fn picks_opds_template_over_html_and_plain_atom() {
+        let t = opensearch_template(OPENSEARCH).unwrap();
+        assert_eq!(
+            t,
+            "https://e.org/opds/all?query={searchTerms}&per-page={count}&page={startPage}"
+        );
+    }
+
+    #[test]
+    fn builds_search_url_encoding_terms_and_dropping_placeholders() {
+        let t = opensearch_template(OPENSEARCH).unwrap();
+        assert_eq!(
+            build_search_url(&t, "war and peace"),
+            "https://e.org/opds/all?query=war+and+peace&per-page=&page="
+        );
+    }
+
+    #[test]
+    fn opensearch_template_rejects_other_documents() {
+        assert!(opensearch_template("<feed/>").is_none());
+        assert!(opensearch_template("not xml").is_none());
+    }
+
+    #[test]
+    fn finds_search_link_in_feed() {
+        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom">
+          <title>X</title>
+          <link rel="search" href="/opensearch" type="application/opensearchdescription+xml"/>
+        </feed>"#;
+        let feed = Feed::parse(xml, "https://e.org/opds").unwrap();
+        assert_eq!(feed.search_link().unwrap().href, "https://e.org/opensearch");
     }
 }
