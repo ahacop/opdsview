@@ -65,6 +65,10 @@ pub struct DetailState {
     pub entry_index: usize,
     /// Index of the highlighted acquisition format.
     pub format: usize,
+    /// When viewing a catalog publication that's already in the local library,
+    /// its library id — lets the user jump to the downloaded copy. `None` for
+    /// library entries and for catalog books not yet downloaded.
+    pub library_id: Option<String>,
 }
 
 /// Backend-specific state for a browse session.
@@ -96,6 +100,9 @@ pub struct LibraryBackend {
     pub shown: Vec<usize>,
     /// The active filter query, if the list is filtered.
     pub query: Option<String>,
+    /// A book id to select and open once the library finishes loading, set when
+    /// jumping here from a catalog entry's "open downloaded copy".
+    pub open_target: Option<String>,
 }
 
 impl LibraryBackend {
@@ -517,7 +524,7 @@ impl App {
     fn open_selected(&mut self) {
         let sel = self.feed_list.selected().unwrap_or(0);
         if sel == 0 {
-            self.open_library();
+            self.open_library(None);
             return;
         }
         let Some(feed) = self.config.feeds.get(sel - 1) else {
@@ -549,8 +556,9 @@ impl App {
         self.outbox.push(Request::Feed { url, auth });
     }
 
-    /// Open the local downloaded-book library.
-    fn open_library(&mut self) {
+    /// Open the local downloaded-book library. When `open_target` is `Some`, the
+    /// book with that id is selected and its detail opened once loading finishes.
+    fn open_library(&mut self, open_target: Option<String>) {
         let mut list = ListState::default();
         list.select(Some(0));
         let browser = BrowserState {
@@ -558,6 +566,7 @@ impl App {
                 books: Vec::new(),
                 shown: Vec::new(),
                 query: None,
+                open_target,
             }),
             feed: None,
             list,
@@ -588,6 +597,15 @@ impl App {
             .map(|l| (l.href.clone(), entry.title.clone()));
         let has_acquisition = entry.acquisition_links().next().is_some();
         let web_url = entry.web_link().map(|l| l.href.clone());
+        // For a catalog book, note whether it's already in the local library so
+        // the detail view can offer a jump to the downloaded copy.
+        let library_id = match &b.backend {
+            Backend::Opds(_) => {
+                let authors: Vec<String> = entry.author_names().map(str::to_string).collect();
+                crate::storage::downloaded_book_id(&authors, &entry.title)
+            }
+            Backend::Library(_) => None,
+        };
 
         // A publication entry: open its detail / download view.
         if nav.is_none() {
@@ -595,6 +613,7 @@ impl App {
                 b.detail = Some(DetailState {
                     entry_index,
                     format: 0,
+                    library_id,
                 });
                 // Lazily fetch reading metrics from the publication's web page
                 // (unless already loaded — library books seed them from disk).
@@ -669,7 +688,45 @@ impl App {
             KeyCode::Enter | KeyCode::Char('d') | KeyCode::Char('o') => {
                 self.activate_selected_format()
             }
+            KeyCode::Char('g') => self.jump_to_downloaded(),
             _ => {}
+        }
+    }
+
+    /// Switch to the library and open the downloaded copy of the catalog book
+    /// whose detail is showing, if it has one.
+    fn jump_to_downloaded(&mut self) {
+        let Screen::Browser(b) = &self.screen else {
+            return;
+        };
+        let Some(id) = b.detail.as_ref().and_then(|d| d.library_id.clone()) else {
+            return;
+        };
+        self.open_library(Some(id));
+    }
+
+    /// After a successful download of `url`, if an open catalog detail is for
+    /// that very book, record its library id so the jump key lights up.
+    fn mark_detail_downloaded(&mut self, url: &str) {
+        let Screen::Browser(b) = &mut self.screen else {
+            return;
+        };
+        if !matches!(b.backend, Backend::Opds(_)) {
+            return;
+        }
+        let Some(detail) = b.detail.as_mut() else {
+            return;
+        };
+        let Some(entry) = b
+            .feed
+            .as_ref()
+            .and_then(|f| f.entries.get(detail.entry_index))
+        else {
+            return;
+        };
+        if entry.acquisition_links().any(|l| l.href == url) {
+            let authors: Vec<String> = entry.author_names().map(str::to_string).collect();
+            detail.library_id = crate::storage::downloaded_book_id(&authors, &entry.title);
         }
     }
 
@@ -913,6 +970,11 @@ impl App {
                         DownloadSlot::Failed(msg)
                     }
                 };
+                // A book just saved while its catalog detail is open can now be
+                // jumped to in the library.
+                if matches!(slot, DownloadSlot::Done(_)) {
+                    self.mark_detail_downloaded(&url);
+                }
                 self.downloads.insert(url, slot);
             }
             Response::Search { query, result } => self.on_search(query, result),
@@ -949,7 +1011,23 @@ impl App {
                 lib.apply_filter(None);
                 let feed = lib.build_feed(&b.title);
                 let len = feed.entries.len();
-                b.list.select(if len == 0 { None } else { Some(0) });
+                // If we arrived here to open a specific book, find its position
+                // in the (unfiltered) shown list and jump straight to its detail.
+                let target = lib
+                    .open_target
+                    .take()
+                    .and_then(|id| lib.shown.iter().position(|&i| lib.books[i].id == id));
+                let select = match (target, len) {
+                    (Some(pos), _) => Some(pos),
+                    (None, 0) => None,
+                    (None, _) => Some(0),
+                };
+                b.list.select(select);
+                b.detail = target.map(|pos| DetailState {
+                    entry_index: pos,
+                    format: 0,
+                    library_id: None,
+                });
                 b.feed = Some(feed);
                 b.error = None;
                 self.request_selected_image();
@@ -1090,6 +1168,7 @@ mod tests {
             books,
             shown: Vec::new(),
             query: None,
+            open_target: None,
         };
         lib.apply_filter(None);
         lib

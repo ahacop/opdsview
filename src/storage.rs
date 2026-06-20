@@ -413,6 +413,19 @@ fn delete_book_in(dir: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The library id for a book if it has already been downloaded, else `None`.
+///
+/// A book counts as downloaded when its metadata sidecar exists in the library
+/// directory. Lets a catalog detail page offer a jump to the saved copy.
+pub fn downloaded_book_id(authors: &[String], title: &str) -> Option<String> {
+    downloaded_book_id_in(&library_dir().ok()?, authors, title)
+}
+
+fn downloaded_book_id_in(dir: &Path, authors: &[String], title: &str) -> Option<String> {
+    let id = book_id(authors, title);
+    dir.join(format!("{id}.json")).exists().then_some(id)
+}
+
 /// Open a downloaded file in the operating system's default application.
 pub fn open_in_reader(path: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
@@ -547,6 +560,31 @@ mod tests {
         assert!(a.starts_with("willa-cather-the-professor-s-house"));
         // A different title yields a different id.
         assert_ne!(a, book_id(&authors, "My Antonia"));
+    }
+
+    #[test]
+    fn downloaded_book_id_detects_saved_books() {
+        let dir = temp_dir("downloaded");
+        let authors = vec!["Willa Cather".to_string()];
+        // Nothing saved yet.
+        assert!(downloaded_book_id_in(&dir, &authors, "The Professor's House").is_none());
+        save_book_in(
+            &dir,
+            sample_meta(),
+            "application/epub+zip",
+            Some(123),
+            "https://se.org/book.epub",
+            b"EPUBDATA",
+            None,
+        )
+        .unwrap();
+        // The saved book is now found by the same author/title…
+        assert_eq!(
+            downloaded_book_id_in(&dir, &authors, "The Professor's House"),
+            Some(book_id(&authors, "The Professor's House"))
+        );
+        // …but a different book is not.
+        assert!(downloaded_book_id_in(&dir, &authors, "My Antonia").is_none());
     }
 
     #[test]

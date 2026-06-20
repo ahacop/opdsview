@@ -55,6 +55,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             } else if b.detail.is_some() {
                 if library {
                     "o/Enter open in reader   ↑↓ format   ⌫/h/Esc back"
+                } else if b
+                    .detail
+                    .as_ref()
+                    .and_then(|d| d.library_id.as_ref())
+                    .is_some()
+                {
+                    "↑↓ format   Enter/d download   g open copy   ⌫/h/Esc back"
                 } else {
                     "↑↓ format   Enter/d download   ⌫/h/Esc back"
                 }
@@ -575,11 +582,23 @@ fn render_detail_page(
         .split(panes[1]);
 
     let reading_slot = entry.web_link().and_then(|l| reading.get(&l.href));
-    render_detail_info(frame, right[0], entry, reading_slot);
+    render_detail_info(
+        frame,
+        right[0],
+        entry,
+        reading_slot,
+        detail.library_id.is_some(),
+    );
     render_detail_formats(frame, right[1], &acquisitions, detail.format, downloads);
 }
 
-fn render_detail_info(frame: &mut Frame, area: Rect, entry: &Entry, reading: Option<&ReadingSlot>) {
+fn render_detail_info(
+    frame: &mut Frame,
+    area: Rect,
+    entry: &Entry,
+    reading: Option<&ReadingSlot>,
+    in_library: bool,
+) {
     let mut lines = vec![Line::from(Span::styled(
         entry.title.clone(),
         Style::default().add_modifier(Modifier::BOLD).fg(ACCENT),
@@ -611,6 +630,14 @@ fn render_detail_info(frame: &mut Frame, area: Rect, entry: &Entry, reading: Opt
             Span::styled("Web: ", Style::default().fg(Color::DarkGray)),
             Span::styled(web.href.clone(), Style::default().fg(Color::Blue)),
         ]));
+    }
+    if in_library {
+        lines.push(Line::from(Span::styled(
+            "✓ In your library — press g to open your downloaded copy",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )));
     }
     lines.push(Line::from(""));
 
