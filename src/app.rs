@@ -103,6 +103,10 @@ pub struct LibraryBackend {
     /// A book id to select and open once the library finishes loading, set when
     /// jumping here from a catalog entry's "open downloaded copy".
     pub open_target: Option<String>,
+    /// The screen to restore when backing out of the library, set when jumping
+    /// here from a catalog so "back" returns to the catalog rather than the
+    /// feed list. `None` for the library opened normally from the feed list.
+    pub return_to: Option<Box<Screen>>,
 }
 
 impl LibraryBackend {
@@ -524,7 +528,7 @@ impl App {
     fn open_selected(&mut self) {
         let sel = self.feed_list.selected().unwrap_or(0);
         if sel == 0 {
-            self.open_library(None);
+            self.open_library(None, None);
             return;
         }
         let Some(feed) = self.config.feeds.get(sel - 1) else {
@@ -557,8 +561,10 @@ impl App {
     }
 
     /// Open the local downloaded-book library. When `open_target` is `Some`, the
-    /// book with that id is selected and its detail opened once loading finishes.
-    fn open_library(&mut self, open_target: Option<String>) {
+    /// book with that id is selected and its detail opened once loading finishes;
+    /// `return_to` is the screen to restore when backing out (the catalog, when
+    /// jumping here from one).
+    fn open_library(&mut self, open_target: Option<String>, return_to: Option<Box<Screen>>) {
         let mut list = ListState::default();
         list.select(Some(0));
         let browser = BrowserState {
@@ -567,6 +573,7 @@ impl App {
                 shown: Vec::new(),
                 query: None,
                 open_target,
+                return_to,
             }),
             feed: None,
             list,
@@ -694,7 +701,8 @@ impl App {
     }
 
     /// Switch to the library and open the downloaded copy of the catalog book
-    /// whose detail is showing, if it has one.
+    /// whose detail is showing, if it has one. The catalog screen is kept so
+    /// backing out of the library returns to it.
     fn jump_to_downloaded(&mut self) {
         let Screen::Browser(b) = &self.screen else {
             return;
@@ -702,7 +710,9 @@ impl App {
         let Some(id) = b.detail.as_ref().and_then(|d| d.library_id.clone()) else {
             return;
         };
-        self.open_library(Some(id));
+        // open_library overwrites self.screen, so take the catalog out first.
+        let catalog = std::mem::replace(&mut self.screen, Screen::FeedList);
+        self.open_library(Some(id), Some(Box::new(catalog)));
     }
 
     /// After a successful download of `url`, if an open catalog detail is for
@@ -859,7 +869,8 @@ impl App {
         let Screen::Browser(b) = &mut self.screen else {
             return;
         };
-        // Library: clear an active filter first; otherwise leave to the feeds.
+        // Library: clear an active filter first; then return to wherever we came
+        // from (the catalog we jumped from, or the feed list).
         if let Backend::Library(lib) = &mut b.backend {
             if lib.query.is_some() {
                 lib.apply_filter(None);
@@ -867,6 +878,8 @@ impl App {
                 let len = feed.entries.len();
                 b.feed = Some(feed);
                 b.list.select(if len == 0 { None } else { Some(0) });
+            } else if let Some(prev) = lib.return_to.take() {
+                self.screen = *prev;
             } else {
                 self.screen = Screen::FeedList;
             }
@@ -1169,6 +1182,7 @@ mod tests {
             shown: Vec::new(),
             query: None,
             open_target: None,
+            return_to: None,
         };
         lib.apply_filter(None);
         lib
