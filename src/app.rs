@@ -117,7 +117,11 @@ impl LibraryBackend {
     fn build_feed(&self, title: &str) -> Feed {
         Feed {
             title: title.to_string(),
-            entries: self.shown.iter().map(|&i| self.books[i].entry.clone()).collect(),
+            entries: self
+                .shown
+                .iter()
+                .map(|&i| self.books[i].entry.clone())
+                .collect(),
             links: Vec::new(),
         }
     }
@@ -307,7 +311,9 @@ impl App {
     }
 
     fn handle_form_key(&mut self, key: KeyEvent) {
-        let Screen::Form(form) = &mut self.screen else { return };
+        let Screen::Form(form) = &mut self.screen else {
+            return;
+        };
         match key.code {
             KeyCode::Esc => self.screen = Screen::FeedList,
             KeyCode::Tab | KeyCode::Down => form.focus = (form.focus + 1) % 4,
@@ -332,7 +338,9 @@ impl App {
             self.handle_detail_key(key);
             return;
         }
-        let Screen::Browser(b) = &mut self.screen else { return };
+        let Screen::Browser(b) = &mut self.screen else {
+            return;
+        };
         let len = b.feed.as_ref().map_or(0, |f| f.entries.len());
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.screen = Screen::FeedList,
@@ -368,7 +376,9 @@ impl App {
     /// Open the search input box. OPDS catalogs must advertise search; the
     /// local library always supports it (an in-memory filter).
     fn open_search(&mut self) {
-        let Screen::Browser(b) = &mut self.screen else { return };
+        let Screen::Browser(b) = &mut self.screen else {
+            return;
+        };
         if let Backend::Opds(o) = &b.backend
             && o.search_url.is_none()
         {
@@ -380,7 +390,9 @@ impl App {
 
     /// Key handling while the search input box is open.
     fn handle_search_key(&mut self, key: KeyEvent) {
-        let Screen::Browser(b) = &mut self.screen else { return };
+        let Screen::Browser(b) = &mut self.screen else {
+            return;
+        };
         match key.code {
             KeyCode::Esc => b.search_query = None,
             KeyCode::Enter => self.submit_search(),
@@ -400,7 +412,9 @@ impl App {
 
     /// Submit the typed query: an OPDS search (async) or a library filter.
     fn submit_search(&mut self) {
-        let Screen::Browser(b) = &mut self.screen else { return };
+        let Screen::Browser(b) = &mut self.screen else {
+            return;
+        };
         let query = b.search_query.take().unwrap_or_default().trim().to_string();
         match &mut b.backend {
             Backend::Library(lib) => {
@@ -435,7 +449,11 @@ impl App {
                 b.error = None;
                 b.feed = None;
                 b.restore_select = Some(0);
-                self.outbox.push(Request::Search { desc_url, query, auth });
+                self.outbox.push(Request::Search {
+                    desc_url,
+                    query,
+                    auth,
+                });
             }
         }
     }
@@ -452,7 +470,9 @@ impl App {
     }
 
     fn submit_form(&mut self) {
-        let Screen::Form(form) = &mut self.screen else { return };
+        let Screen::Form(form) = &mut self.screen else {
+            return;
+        };
         let url = form.fields[1].trim().to_string();
         if url.is_empty() {
             form.error = Some("URL is required".into());
@@ -460,11 +480,19 @@ impl App {
         }
         let name = {
             let n = form.fields[0].trim();
-            if n.is_empty() { url.clone() } else { n.to_string() }
+            if n.is_empty() {
+                url.clone()
+            } else {
+                n.to_string()
+            }
         };
         let opt = |s: &str| {
             let s = s.trim();
-            if s.is_empty() { None } else { Some(s.to_string()) }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
         };
         let feed = FeedConfig {
             id: form.editing_id.unwrap_or(0),
@@ -492,7 +520,9 @@ impl App {
             self.open_library();
             return;
         }
-        let Some(feed) = self.config.feeds.get(sel - 1) else { return };
+        let Some(feed) = self.config.feeds.get(sel - 1) else {
+            return;
+        };
         let auth = feed.auth();
         let url = feed.url.clone();
         let title = feed.name.clone();
@@ -545,18 +575,27 @@ impl App {
     // --- Browser navigation ----------------------------------------------
 
     fn follow_selected(&mut self) {
-        let Screen::Browser(b) = &mut self.screen else { return };
-        let Some(entry) = b.selected_entry() else { return };
+        let Screen::Browser(b) = &mut self.screen else {
+            return;
+        };
+        let Some(entry) = b.selected_entry() else {
+            return;
+        };
         // Read everything off `entry` before mutating `b` (entry borrows b).
         let entry_index = b.list.selected().unwrap_or(0);
-        let nav = entry.nav_link().map(|l| (l.href.clone(), entry.title.clone()));
+        let nav = entry
+            .nav_link()
+            .map(|l| (l.href.clone(), entry.title.clone()));
         let has_acquisition = entry.acquisition_links().next().is_some();
         let web_url = entry.web_link().map(|l| l.href.clone());
 
         // A publication entry: open its detail / download view.
         if nav.is_none() {
             if has_acquisition {
-                b.detail = Some(DetailState { entry_index, format: 0 });
+                b.detail = Some(DetailState {
+                    entry_index,
+                    format: 0,
+                });
                 // Lazily fetch reading metrics from the publication's web page
                 // (unless already loaded — library books seed them from disk).
                 if let Some(url) = web_url
@@ -573,8 +612,12 @@ impl App {
         }
 
         // A navigation entry: load the linked sub-catalog (OPDS only).
-        let Some((next_url, next_title)) = nav else { return };
-        let Backend::Opds(o) = &mut b.backend else { return };
+        let Some((next_url, next_title)) = nav else {
+            return;
+        };
+        let Backend::Opds(o) = &mut b.backend else {
+            return;
+        };
         o.stack.push(Crumb {
             url: o.current_url.clone(),
             title: b.title.clone(),
@@ -588,13 +631,20 @@ impl App {
         b.error = None;
         b.feed = None;
         b.restore_select = Some(0);
-        self.outbox.push(Request::Feed { url: next_url, auth });
+        self.outbox.push(Request::Feed {
+            url: next_url,
+            auth,
+        });
     }
 
     /// Key handling while the publication detail view is open.
     fn handle_detail_key(&mut self, key: KeyEvent) {
-        let Screen::Browser(b) = &mut self.screen else { return };
-        let Some(detail) = b.detail.as_mut() else { return };
+        let Screen::Browser(b) = &mut self.screen else {
+            return;
+        };
+        let Some(detail) = b.detail.as_mut() else {
+            return;
+        };
         let formats = b
             .feed
             .as_ref()
@@ -639,12 +689,22 @@ impl App {
     /// Queue a download of the format highlighted in the detail view, carrying
     /// the metadata the worker needs to persist a library sidecar.
     fn download_selected_format(&mut self) {
-        let Screen::Browser(b) = &self.screen else { return };
-        let Some(detail) = b.detail.as_ref() else { return };
-        let Some(entry) = b.feed.as_ref().and_then(|f| f.entries.get(detail.entry_index)) else {
+        let Screen::Browser(b) = &self.screen else {
             return;
         };
-        let Some(link) = entry.acquisition_links().nth(detail.format) else { return };
+        let Some(detail) = b.detail.as_ref() else {
+            return;
+        };
+        let Some(entry) = b
+            .feed
+            .as_ref()
+            .and_then(|f| f.entries.get(detail.entry_index))
+        else {
+            return;
+        };
+        let Some(link) = entry.acquisition_links().nth(detail.format) else {
+            return;
+        };
         let url = link.href.clone();
         // Don't re-queue a download that's already running.
         if matches!(self.downloads.get(&url), Some(DownloadSlot::Pending)) {
@@ -676,12 +736,22 @@ impl App {
 
     /// Open the highlighted local format in the OS default reader.
     fn open_selected_format(&mut self) {
-        let Screen::Browser(b) = &self.screen else { return };
-        let Some(detail) = b.detail.as_ref() else { return };
-        let Some(entry) = b.feed.as_ref().and_then(|f| f.entries.get(detail.entry_index)) else {
+        let Screen::Browser(b) = &self.screen else {
             return;
         };
-        let Some(link) = entry.acquisition_links().nth(detail.format) else { return };
+        let Some(detail) = b.detail.as_ref() else {
+            return;
+        };
+        let Some(entry) = b
+            .feed
+            .as_ref()
+            .and_then(|f| f.entries.get(detail.entry_index))
+        else {
+            return;
+        };
+        let Some(link) = entry.acquisition_links().nth(detail.format) else {
+            return;
+        };
         let path = PathBuf::from(&link.href);
         match crate::storage::open_in_reader(&path) {
             Ok(()) => self.status = format!("Opened {}", path.display()),
@@ -691,7 +761,9 @@ impl App {
 
     /// Open a delete-confirmation for the highlighted library book.
     fn confirm_delete_selected_book(&mut self) {
-        let Screen::Browser(b) = &self.screen else { return };
+        let Screen::Browser(b) = &self.screen else {
+            return;
+        };
         if !matches!(b.backend, Backend::Library(_)) {
             return;
         }
@@ -702,9 +774,15 @@ impl App {
 
     /// Delete the library book at `shown` index `shown_idx` (files + sidecar).
     fn delete_book(&mut self, shown_idx: usize) {
-        let Screen::Browser(b) = &mut self.screen else { return };
-        let Backend::Library(lib) = &mut b.backend else { return };
-        let Some(&book_idx) = lib.shown.get(shown_idx) else { return };
+        let Screen::Browser(b) = &mut self.screen else {
+            return;
+        };
+        let Backend::Library(lib) = &mut b.backend else {
+            return;
+        };
+        let Some(&book_idx) = lib.shown.get(shown_idx) else {
+            return;
+        };
         let id = lib.books[book_idx].id.clone();
         if let Err(e) = crate::storage::delete_book(&id) {
             self.status = format!("Delete failed: {e:#}");
@@ -721,7 +799,9 @@ impl App {
     }
 
     fn go_back(&mut self) {
-        let Screen::Browser(b) = &mut self.screen else { return };
+        let Screen::Browser(b) = &mut self.screen else {
+            return;
+        };
         // Library: clear an active filter first; otherwise leave to the feeds.
         if let Backend::Library(lib) = &mut b.backend {
             if lib.query.is_some() {
@@ -736,7 +816,9 @@ impl App {
             return;
         }
 
-        let Backend::Opds(o) = &mut b.backend else { return };
+        let Backend::Opds(o) = &mut b.backend else {
+            return;
+        };
         match o.stack.pop() {
             Some(crumb) => {
                 let auth = o.auth.clone();
@@ -747,14 +829,19 @@ impl App {
                 b.error = None;
                 b.feed = None;
                 b.restore_select = Some(crumb.selected);
-                self.outbox.push(Request::Feed { url: crumb.url, auth });
+                self.outbox.push(Request::Feed {
+                    url: crumb.url,
+                    auth,
+                });
             }
             None => self.screen = Screen::FeedList,
         }
     }
 
     fn next_page(&mut self) {
-        let Screen::Browser(b) = &mut self.screen else { return };
+        let Screen::Browser(b) = &mut self.screen else {
+            return;
+        };
         let Backend::Opds(o) = &mut b.backend else {
             self.status = "No further pages".into();
             return;
@@ -776,14 +863,23 @@ impl App {
         b.error = None;
         b.feed = None;
         b.restore_select = Some(0);
-        self.outbox.push(Request::Feed { url: next_url, auth });
+        self.outbox.push(Request::Feed {
+            url: next_url,
+            auth,
+        });
     }
 
     /// Queue an image fetch for the currently selected entry, if needed.
     fn request_selected_image(&mut self) {
-        let Screen::Browser(b) = &self.screen else { return };
-        let Some(entry) = b.selected_entry() else { return };
-        let Some(link) = entry.image_link() else { return };
+        let Screen::Browser(b) = &self.screen else {
+            return;
+        };
+        let Some(entry) = b.selected_entry() else {
+            return;
+        };
+        let Some(link) = entry.image_link() else {
+            return;
+        };
         let url = link.href.clone();
         if self.images.contains_key(&url) {
             return;
@@ -832,8 +928,12 @@ impl App {
     }
 
     fn on_library(&mut self, result: anyhow::Result<Vec<LibraryBook>>) {
-        let Screen::Browser(b) = &mut self.screen else { return };
-        let Backend::Library(lib) = &mut b.backend else { return };
+        let Screen::Browser(b) = &mut self.screen else {
+            return;
+        };
+        let Backend::Library(lib) = &mut b.backend else {
+            return;
+        };
         b.loading = false;
         match result {
             Ok(books) => {
@@ -862,8 +962,12 @@ impl App {
     }
 
     fn on_search(&mut self, query: String, result: anyhow::Result<(String, Feed)>) {
-        let Screen::Browser(b) = &mut self.screen else { return };
-        let Backend::Opds(o) = &mut b.backend else { return };
+        let Screen::Browser(b) = &mut self.screen else {
+            return;
+        };
+        let Backend::Opds(o) = &mut b.backend else {
+            return;
+        };
         // Ignore results for a search the user has since abandoned.
         if o.pending_search.as_deref() != Some(query.as_str()) {
             return;
@@ -877,7 +981,11 @@ impl App {
                     o.search_url = Some(s.href.clone());
                 }
                 let len = feed.entries.len();
-                let sel = b.restore_select.take().unwrap_or(0).min(len.saturating_sub(1));
+                let sel = b
+                    .restore_select
+                    .take()
+                    .unwrap_or(0)
+                    .min(len.saturating_sub(1));
                 b.list.select(if len == 0 { None } else { Some(sel) });
                 b.feed = Some(feed);
                 b.error = None;
@@ -891,8 +999,12 @@ impl App {
     }
 
     fn on_feed(&mut self, url: String, result: anyhow::Result<Feed>) {
-        let Screen::Browser(b) = &mut self.screen else { return };
-        let Backend::Opds(o) = &mut b.backend else { return };
+        let Screen::Browser(b) = &mut self.screen else {
+            return;
+        };
+        let Backend::Opds(o) = &mut b.backend else {
+            return;
+        };
         // Ignore responses for feeds we've already navigated away from.
         if o.current_url != url {
             return;
@@ -908,7 +1020,11 @@ impl App {
                     o.search_url = Some(s.href.clone());
                 }
                 let len = feed.entries.len();
-                let sel = b.restore_select.take().unwrap_or(0).min(len.saturating_sub(1));
+                let sel = b
+                    .restore_select
+                    .take()
+                    .unwrap_or(0)
+                    .min(len.saturating_sub(1));
                 b.list.select(if len == 0 { None } else { Some(sel) });
                 b.feed = Some(feed);
                 b.error = None;
@@ -967,7 +1083,11 @@ mod tests {
     }
 
     fn library(books: Vec<LibraryBook>) -> LibraryBackend {
-        let mut lib = LibraryBackend { books, shown: Vec::new(), query: None };
+        let mut lib = LibraryBackend {
+            books,
+            shown: Vec::new(),
+            query: None,
+        };
         lib.apply_filter(None);
         lib
     }

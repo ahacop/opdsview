@@ -13,7 +13,7 @@ use image::DynamicImage;
 
 use crate::cache::Cache;
 use crate::opds::Feed;
-use crate::reading::{extract_reading_text, ReadingStats};
+use crate::reading::{ReadingStats, extract_reading_text};
 use crate::storage::{self, LibraryBook, LibraryEntry};
 
 /// How long a cached feed response is considered fresh.
@@ -41,7 +41,11 @@ pub enum Request {
     Library,
     /// Run an OpenSearch query: resolve the description at `desc_url`, then
     /// fetch the resulting acquisition feed.
-    Search { desc_url: String, query: String, auth: Auth },
+    Search {
+        desc_url: String,
+        query: String,
+        auth: Auth,
+    },
     /// Scrape supplementary reading metrics from a publication's web page,
     /// keyed by that page's URL.
     Reading { url: String, auth: Auth },
@@ -49,13 +53,30 @@ pub enum Request {
 
 /// A response delivered from the worker back to the UI thread.
 pub enum Response {
-    Feed { url: String, result: Result<Feed> },
-    Image { url: String, result: Result<DynamicImage> },
-    Download { url: String, result: Result<PathBuf> },
-    Library { result: Result<Vec<LibraryBook>> },
+    Feed {
+        url: String,
+        result: Result<Feed>,
+    },
+    Image {
+        url: String,
+        result: Result<DynamicImage>,
+    },
+    Download {
+        url: String,
+        result: Result<PathBuf>,
+    },
+    Library {
+        result: Result<Vec<LibraryBook>>,
+    },
     /// A search result: the resolved feed URL and its parsed feed.
-    Search { query: String, result: Result<(String, Feed)> },
-    Reading { url: String, result: Result<ReadingStats> },
+    Search {
+        query: String,
+        result: Result<(String, Feed)>,
+    },
+    Reading {
+        url: String,
+        result: Result<ReadingStats>,
+    },
 }
 
 /// Handle to the worker thread.
@@ -86,9 +107,23 @@ impl Worker {
                         let result = fetch_image(&http, &cache, &url, &auth);
                         let _ = resp_tx.send(Response::Image { url, result });
                     }
-                    Request::Download { meta, url, mime, length, cover_url, auth } => {
+                    Request::Download {
+                        meta,
+                        url,
+                        mime,
+                        length,
+                        cover_url,
+                        auth,
+                    } => {
                         let result = download_book(
-                            &http, &cache, *meta, &url, &mime, length, cover_url.as_deref(), &auth,
+                            &http,
+                            &cache,
+                            *meta,
+                            &url,
+                            &mime,
+                            length,
+                            cover_url.as_deref(),
+                            &auth,
                         );
                         let _ = resp_tx.send(Response::Download { url, result });
                     }
@@ -96,7 +131,11 @@ impl Worker {
                         let result = storage::load_library();
                         let _ = resp_tx.send(Response::Library { result });
                     }
-                    Request::Search { desc_url, query, auth } => {
+                    Request::Search {
+                        desc_url,
+                        query,
+                        auth,
+                    } => {
                         let result = search(&http, &cache, &desc_url, &query, &auth);
                         let _ = resp_tx.send(Response::Search { query, result });
                     }
@@ -108,7 +147,10 @@ impl Worker {
             }
         });
 
-        Ok(Self { tx: req_tx, rx: resp_rx })
+        Ok(Self {
+            tx: req_tx,
+            rx: resp_rx,
+        })
     }
 
     pub fn request(&self, req: Request) {
@@ -116,11 +158,7 @@ impl Worker {
     }
 }
 
-fn get_bytes(
-    http: &reqwest::blocking::Client,
-    url: &str,
-    auth: &Auth,
-) -> Result<Vec<u8>> {
+fn get_bytes(http: &reqwest::blocking::Client, url: &str, auth: &Auth) -> Result<Vec<u8>> {
     let mut req = http.get(url);
     if let Some((user, pass)) = auth {
         req = req.basic_auth(user, Some(pass));
@@ -140,9 +178,10 @@ fn fetch_feed(
 ) -> Result<Feed> {
     if let Some(bytes) = cache.get(url, "xml", Some(FEED_TTL))
         && let Ok(text) = String::from_utf8(bytes)
-            && let Ok(feed) = Feed::parse(&text, url) {
-                return Ok(feed);
-            }
+        && let Ok(feed) = Feed::parse(&text, url)
+    {
+        return Ok(feed);
+    }
     let bytes = get_bytes(http, url, auth)?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let feed = Feed::parse(&text, url)?;
@@ -157,8 +196,7 @@ fn fetch_image(
     auth: &Auth,
 ) -> Result<DynamicImage> {
     let bytes = image_bytes(http, cache, url, auth)?;
-    let img = image::load_from_memory(&bytes)
-        .with_context(|| format!("decoding image {url}"))?;
+    let img = image::load_from_memory(&bytes).with_context(|| format!("decoding image {url}"))?;
     Ok(img)
 }
 

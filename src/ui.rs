@@ -6,14 +6,12 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap,
-};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui_image::StatefulImage;
 
 use crate::app::{
-    App, Backend, BrowserState, Confirm, DownloadSlot, FormState, ImageSlot, ReadingSlot, Screen,
-    FORM_LABELS,
+    App, Backend, BrowserState, Confirm, DownloadSlot, FORM_LABELS, FormState, ImageSlot,
+    ReadingSlot, Screen,
 };
 use crate::opds::Entry;
 use crate::reading::ReadingStats;
@@ -36,11 +34,19 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     match &app.screen {
         Screen::FeedList => {
             render_feed_list(frame, chunks[1], app);
-            render_help(frame, chunks[2], "↑↓ move   n new   e edit   d delete   Enter open   q quit");
+            render_help(
+                frame,
+                chunks[2],
+                "↑↓ move   n new   e edit   d delete   Enter open   q quit",
+            );
         }
         Screen::Form(form) => {
             render_form(frame, chunks[1], form);
-            render_help(frame, chunks[2], "Tab/↑↓ field   type to edit   Enter save   Esc cancel");
+            render_help(
+                frame,
+                chunks[2],
+                "Tab/↑↓ field   type to edit   Enter save   Esc cancel",
+            );
         }
         Screen::Browser(b) => {
             let library = matches!(b.backend, Backend::Library(_));
@@ -107,7 +113,10 @@ fn render_title_bar(frame: &mut Frame, area: Rect, screen: &Screen) {
     };
     let bar = Paragraph::new(Line::from(Span::styled(
         title,
-        Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Black)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD),
     )))
     .style(Style::default().bg(ACCENT));
     frame.render_widget(bar, area);
@@ -158,7 +167,9 @@ fn render_feed_list(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.config.feeds.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
             "  Press 'n' to add an OPDS catalog, e.g. https://standardebooks.org/opds",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         ))));
     }
 
@@ -261,7 +272,10 @@ fn render_entry_list(frame: &mut Frame, area: Rect, b: &BrowserState) {
     if let Some(err) = &b.error {
         let p = Paragraph::new(vec![
             Line::from(""),
-            Line::from(Span::styled("  Failed to load feed", Style::default().fg(Color::Red))),
+            Line::from(Span::styled(
+                "  Failed to load feed",
+                Style::default().fg(Color::Red),
+            )),
             Line::from(""),
             Line::from(format!("  {err}")),
         ])
@@ -275,7 +289,9 @@ fn render_entry_list(frame: &mut Frame, area: Rect, b: &BrowserState) {
     if entries.is_empty() {
         let msg = match &b.backend {
             Backend::Library(lib) if lib.query.is_some() => "\n  No books match your search.",
-            Backend::Library(_) => "\n  No downloaded books yet.\n\n  Browse a catalog and press Enter on a book to download it.",
+            Backend::Library(_) => {
+                "\n  No downloaded books yet.\n\n  Browse a catalog and press Enter on a book to download it."
+            }
             Backend::Opds(_) => "\n  (empty feed)",
         };
         let p = Paragraph::new(msg).wrap(Wrap { trim: false }).block(block);
@@ -324,7 +340,9 @@ fn render_detail(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let Some(entry) = b.selected_entry() else { return };
+    let Some(entry) = b.selected_entry() else {
+        return;
+    };
 
     let split = Layout::default()
         .direction(Direction::Vertical)
@@ -406,7 +424,9 @@ fn render_entry_text(frame: &mut Frame, area: Rect, entry: &Entry) {
         }
         lines.push(Line::from(Span::styled(
             "Press Enter to view & download",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )));
     }
 
@@ -429,10 +449,7 @@ fn push_meta_lines(lines: &mut Vec<Line>, entry: &Entry) {
     }
     for (label, value) in meta {
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("{label}: "),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
             Span::raw(value),
         ]));
     }
@@ -474,14 +491,18 @@ fn reading_field_line(label: &str, value: Option<String>) -> Line<'static> {
         Some(v) => meta_line(label, v),
         None => Line::from(Span::styled(
             format!("{label}: …"),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )),
     }
 }
 
 /// "60,463 words (3 hours 40 minutes)", as far as the available fields allow.
 fn reading_length(stats: &ReadingStats) -> Option<String> {
-    let words = stats.word_count.map(|n| format!("{} words", group_thousands(n)));
+    let words = stats
+        .word_count
+        .map(|n| format!("{} words", group_thousands(n)));
     match (words, &stats.reading_time) {
         (Some(w), Some(t)) => Some(format!("{w} ({t})")),
         (Some(w), None) => Some(w),
@@ -517,8 +538,12 @@ fn render_detail_page(
     downloads: &HashMap<String, DownloadSlot>,
     reading: &HashMap<String, ReadingSlot>,
 ) {
-    let Some(entry) = b.detail_entry() else { return };
-    let Some(detail) = b.detail.as_ref() else { return };
+    let Some(entry) = b.detail_entry() else {
+        return;
+    };
+    let Some(detail) = b.detail.as_ref() else {
+        return;
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -554,12 +579,7 @@ fn render_detail_page(
     render_detail_formats(frame, right[1], &acquisitions, detail.format, downloads);
 }
 
-fn render_detail_info(
-    frame: &mut Frame,
-    area: Rect,
-    entry: &Entry,
-    reading: Option<&ReadingSlot>,
-) {
+fn render_detail_info(frame: &mut Frame, area: Rect, entry: &Entry, reading: Option<&ReadingSlot>) {
     let mut lines = vec![Line::from(Span::styled(
         entry.title.clone(),
         Style::default().add_modifier(Modifier::BOLD).fg(ACCENT),
@@ -599,12 +619,10 @@ fn render_detail_formats(
     selected: usize,
     downloads: &HashMap<String, DownloadSlot>,
 ) {
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .title(Span::styled(
-            " Download ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+    let block = Block::default().borders(Borders::TOP).title(Span::styled(
+        " Download ",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
 
     if links.is_empty() {
         let p = Paragraph::new("  No downloadable formats").block(block);
@@ -688,8 +706,12 @@ fn render_confirm_delete(frame: &mut Frame, area: Rect, app: &App, confirm: &Con
 
 /// Title of the library book at `shown` index `i` in the open browser, if any.
 fn library_book_title(app: &App, i: usize) -> Option<String> {
-    let Screen::Browser(b) = &app.screen else { return None };
-    let Backend::Library(lib) = &b.backend else { return None };
+    let Screen::Browser(b) = &app.screen else {
+        return None;
+    };
+    let Backend::Library(lib) = &b.backend else {
+        return None;
+    };
     let &book_idx = lib.shown.get(i)?;
     Some(lib.books.get(book_idx)?.meta.title.clone())
 }

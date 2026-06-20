@@ -160,13 +160,19 @@ impl Feed {
         let doc = roxmltree::Document::parse(xml).context("parsing OPDS XML")?;
         let root = doc.root_element();
         if !local_name_is(&root, "feed") {
-            anyhow::bail!("not an OPDS feed (root element <{}>)", root.tag_name().name());
+            anyhow::bail!(
+                "not an OPDS feed (root element <{}>)",
+                root.tag_name().name()
+            );
         }
 
         let base = Url::parse(base_url).ok();
         let resolve = |href: &str| -> String {
             match &base {
-                Some(b) => b.join(href).map(|u| u.to_string()).unwrap_or_else(|_| href.to_string()),
+                Some(b) => b
+                    .join(href)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| href.to_string()),
                 None => href.to_string(),
             }
         };
@@ -279,10 +285,7 @@ fn parse_entry<F: Fn(&str) -> String>(node: &roxmltree::Node, resolve: &F) -> En
             "updated" => set_if_empty(&mut entry.updated, text_of(&child)),
             "rights" => set_if_empty(&mut entry.rights, text_of(&child)),
             "category" => {
-                if let Some(term) = child
-                    .attribute("label")
-                    .or_else(|| child.attribute("term"))
-                {
+                if let Some(term) = child.attribute("label").or_else(|| child.attribute("term")) {
                     let term = collapse_ws(term);
                     if !term.is_empty() && !entry.categories.iter().any(|c| c.term == term) {
                         let scheme = child.attribute("scheme").map(str::to_string);
@@ -346,9 +349,10 @@ fn text_of(node: &roxmltree::Node) -> String {
     let mut out = String::new();
     for d in node.descendants() {
         if d.is_text()
-            && let Some(t) = d.text() {
-                out.push_str(t);
-            }
+            && let Some(t) = d.text()
+        {
+            out.push_str(t);
+        }
     }
     collapse_ws(&out)
 }
@@ -491,7 +495,10 @@ mod tests {
         assert_eq!(book.rights.as_deref(), Some("Public domain."));
         // Detailed subjects prefer label over term and are de-duplicated; the
         // genre-vocabulary term is split out from the subject headings.
-        assert_eq!(book.subjects().collect::<Vec<_>>(), vec!["Fiction", "Adventure"]);
+        assert_eq!(
+            book.subjects().collect::<Vec<_>>(),
+            vec!["Fiction", "Adventure"]
+        );
         assert_eq!(book.genres().collect::<Vec<_>>(), vec!["Nonfiction"]);
         // Content has tags stripped, entities decoded, and paragraphs split.
         assert_eq!(

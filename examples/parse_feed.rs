@@ -39,8 +39,14 @@ fn main() -> anyhow::Result<()> {
         println!("      published: {:?}", entry.published);
         println!("      language:  {:?}", entry.language);
         println!("      publisher: {:?}", entry.publisher);
-        println!("      genres:    {}", entry.genres().collect::<Vec<_>>().join(", "));
-        println!("      subjects:  {}", entry.subjects().collect::<Vec<_>>().join(", "));
+        println!(
+            "      genres:    {}",
+            entry.genres().collect::<Vec<_>>().join(", ")
+        );
+        println!(
+            "      subjects:  {}",
+            entry.subjects().collect::<Vec<_>>().join(", ")
+        );
         println!("      cover:     {:?}", entry.image_link().map(|l| &l.href));
         println!("      web page:  {:?}", entry.web_link().map(|l| &l.href));
         if let Some(content) = &entry.content {

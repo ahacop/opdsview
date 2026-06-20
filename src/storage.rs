@@ -209,9 +209,17 @@ fn load_library_from(dir: &Path) -> Result<Vec<LibraryBook>> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let Ok(data) = fs::read_to_string(&path) else { continue };
-        let Ok(meta) = serde_json::from_str::<LibraryEntry>(&data) else { continue };
-        let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+        let Ok(data) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<LibraryEntry>(&data) else {
+            continue;
+        };
+        let Some(id) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
             continue;
         };
         let entry = library_to_entry(dir, &meta);
@@ -294,7 +302,15 @@ pub fn save_book(
     ebook_bytes: &[u8],
     cover_bytes: Option<&[u8]>,
 ) -> Result<PathBuf> {
-    save_book_in(&library_dir()?, meta, mime, length, ebook_url, ebook_bytes, cover_bytes)
+    save_book_in(
+        &library_dir()?,
+        meta,
+        mime,
+        length,
+        ebook_url,
+        ebook_bytes,
+        cover_bytes,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -317,7 +333,10 @@ fn save_book_in(
     let existing: Option<LibraryEntry> = fs::read_to_string(&sidecar)
         .ok()
         .and_then(|d| serde_json::from_str(&d).ok());
-    let mut files = existing.as_ref().map(|e| e.files.clone()).unwrap_or_default();
+    let mut files = existing
+        .as_ref()
+        .map(|e| e.files.clone())
+        .unwrap_or_default();
     let mut cover_file = existing.and_then(|e| e.cover_file);
 
     // Write the ebook file.
@@ -415,7 +434,13 @@ fn book_id(authors: &[String], title: &str) -> String {
 
     let slug: String = base
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     let slug = slug
         .split('-')
@@ -476,10 +501,8 @@ mod tests {
     fn temp_dir(tag: &str) -> PathBuf {
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "opdsview-test-{}-{tag}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("opdsview-test-{}-{tag}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
@@ -489,7 +512,9 @@ mod tests {
             title: "The Professor's House".to_string(),
             authors: vec!["Willa Cather".to_string()],
             summary: Some("A blurb.".to_string()),
-            web_url: Some("https://standardebooks.org/ebooks/willa-cather/the-professors-house".to_string()),
+            web_url: Some(
+                "https://standardebooks.org/ebooks/willa-cather/the-professors-house".to_string(),
+            ),
             categories: vec![("Fiction".to_string(), Some("lcsh".to_string()))],
             ..Default::default()
         }
@@ -562,8 +587,26 @@ mod tests {
     #[test]
     fn second_format_merges_into_one_record() {
         let dir = temp_dir("merge");
-        save_book_in(&dir, sample_meta(), "application/epub+zip", None, "https://se.org/b.epub", b"E", Some(b"C")).unwrap();
-        save_book_in(&dir, sample_meta(), "application/x-mobipocket-ebook", None, "https://se.org/b.azw3", b"A", None).unwrap();
+        save_book_in(
+            &dir,
+            sample_meta(),
+            "application/epub+zip",
+            None,
+            "https://se.org/b.epub",
+            b"E",
+            Some(b"C"),
+        )
+        .unwrap();
+        save_book_in(
+            &dir,
+            sample_meta(),
+            "application/x-mobipocket-ebook",
+            None,
+            "https://se.org/b.azw3",
+            b"A",
+            None,
+        )
+        .unwrap();
 
         let books = load_library_from(&dir).unwrap();
         // Still one book, now with two formats and the original cover.
@@ -577,7 +620,16 @@ mod tests {
     #[test]
     fn delete_removes_files_and_sidecar() {
         let dir = temp_dir("delete");
-        save_book_in(&dir, sample_meta(), "application/epub+zip", None, "https://se.org/b.epub", b"E", Some(b"C")).unwrap();
+        save_book_in(
+            &dir,
+            sample_meta(),
+            "application/epub+zip",
+            None,
+            "https://se.org/b.epub",
+            b"E",
+            Some(b"C"),
+        )
+        .unwrap();
         let id = load_library_from(&dir).unwrap()[0].id.clone();
 
         delete_book_in(&dir, &id).unwrap();

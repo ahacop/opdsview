@@ -6,11 +6,11 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
 use ratatui_image::picker::Picker;
 
-use opdsview::app::{is_ctrl_c, App};
+use opdsview::app::{App, is_ctrl_c};
 use opdsview::cache::Cache;
-use opdsview::storage::{cache_dir, Config};
-use opdsview::worker::Worker;
+use opdsview::storage::{Config, cache_dir};
 use opdsview::ui;
+use opdsview::worker::Worker;
 
 fn main() -> Result<()> {
     let config = Config::load()?;
@@ -41,14 +41,15 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App, worker: &Worker) 
 
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press {
-                    app.status.clear();
-                    if is_ctrl_c(&key) {
-                        break;
-                    }
-                    app.handle_key(key);
-                    dispatch(app, worker);
-                }
+            && key.kind == KeyEventKind::Press
+        {
+            app.status.clear();
+            if is_ctrl_c(&key) {
+                break;
+            }
+            app.handle_key(key);
+            dispatch(app, worker);
+        }
 
         if app.should_quit {
             break;

@@ -34,20 +34,29 @@ impl ReadingStats {
         let reading_time = slice_between(sentence, "(", ")").map(|s| s.trim().to_string());
 
         // "reading ease of 72.56 (fairly easy)" → "72.56" and "fairly easy".
-        let after_ease = sentence.split_once("reading ease of ").map(|(_, rest)| rest);
+        let after_ease = sentence
+            .split_once("reading ease of ")
+            .map(|(_, rest)| rest);
         let reading_ease = after_ease
-            .map(|rest| rest.split([' ', '(']).next().unwrap_or("").trim().to_string())
+            .map(|rest| {
+                rest.split([' ', '('])
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            })
             .filter(|s| !s.is_empty());
         let difficulty = after_ease
             .and_then(|rest| slice_between(rest, "(", ")"))
             .map(|s| s.trim().to_string());
 
-        let stats = ReadingStats { word_count, reading_time, reading_ease, difficulty };
-        if stats.is_empty() {
-            None
-        } else {
-            Some(stats)
-        }
+        let stats = ReadingStats {
+            word_count,
+            reading_time,
+            reading_ease,
+            difficulty,
+        };
+        if stats.is_empty() { None } else { Some(stats) }
     }
 
     /// Extract and parse reading stats directly from a book's HTML page.
@@ -71,11 +80,7 @@ pub fn extract_reading_text(html: &str) -> Option<String> {
     let aside = slice_between(html, "id=\"reading-ease\"", "</aside>")?;
     let paragraph = slice_between(aside, "<p>", "</p>")?;
     let text = collapse_ws(&strip_tags(paragraph));
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    if text.is_empty() { None } else { Some(text) }
 }
 
 /// The substring of `s` between the first `start` marker and the next `end`
@@ -136,7 +141,10 @@ mod tests {
             "60,463 words (3 hours 40 minutes) with a reading ease of 72.56 (fairly easy)"
         );
         // And the convenience path parses it end to end.
-        assert_eq!(ReadingStats::from_html(ASIDE).unwrap().word_count, Some(60_463));
+        assert_eq!(
+            ReadingStats::from_html(ASIDE).unwrap().word_count,
+            Some(60_463)
+        );
     }
 
     #[test]

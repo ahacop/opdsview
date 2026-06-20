@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use opdsview::cache::Cache;
 use opdsview::opds::Feed;
-use opdsview::storage::{cache_dir, LibraryEntry};
+use opdsview::storage::{LibraryEntry, cache_dir};
 use opdsview::worker::{Request, Response, Worker};
 
 fn main() -> anyhow::Result<()> {
