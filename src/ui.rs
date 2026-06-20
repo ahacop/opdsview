@@ -413,10 +413,18 @@ fn push_meta_lines(lines: &mut Vec<Line>, entry: &Entry) {
             Span::raw(value),
         ]));
     }
-    if !entry.categories.is_empty() {
+    let genres: Vec<&str> = entry.genres().collect();
+    if !genres.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Genre: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(genres.join(", ")),
+        ]));
+    }
+    let subjects: Vec<&str> = entry.subjects().collect();
+    if !subjects.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("Subjects: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(entry.categories.join(", ")),
+            Span::raw(subjects.join(", ")),
         ]));
     }
 }

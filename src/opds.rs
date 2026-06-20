@@ -11,6 +11,11 @@ const REL_ACQUISITION: &str = "http://opds-spec.org/acquisition";
 const REL_IMAGE: &str = "http://opds-spec.org/image";
 const REL_THUMBNAIL: &str = "http://opds-spec.org/image/thumbnail";
 
+/// Scheme URI marking a broad genre vocabulary (Standard Ebooks' own subject
+/// list: "Fiction", "Nonfiction", …) as opposed to detailed subject headings
+/// like LCSH. Matched as a substring so the http/https forms both hit.
+const SCHEME_GENRE: &str = "standardebooks.org/vocab/subjects";
+
 /// A single `<link>` within a feed or entry, with its href resolved to absolute.
 #[derive(Debug, Clone)]
 pub struct Link {
@@ -34,6 +39,25 @@ impl Link {
     }
 }
 
+/// A subject or genre term from a `<category>`, tagged with the vocabulary
+/// (`scheme`) it came from so broad genres can be separated from detailed
+/// subject headings.
+#[derive(Debug, Clone)]
+pub struct Category {
+    pub term: String,
+    pub scheme: Option<String>,
+}
+
+impl Category {
+    /// True when the term comes from a broad genre vocabulary rather than a
+    /// detailed subject-heading scheme like LCSH.
+    fn is_genre(&self) -> bool {
+        self.scheme
+            .as_deref()
+            .is_some_and(|s| s.contains(SCHEME_GENRE))
+    }
+}
+
 /// An OPDS entry: either a navigation item (sub-catalog) or a publication.
 #[derive(Debug, Clone, Default)]
 pub struct Entry {
@@ -53,8 +77,9 @@ pub struct Entry {
     pub updated: Option<String>,
     /// Rights / licensing statement (`<rights>`).
     pub rights: Option<String>,
-    /// Subject/genre terms (`<category term=…>`), de-duplicated.
-    pub categories: Vec<String>,
+    /// Subject/genre terms (`<category>`), de-duplicated, each tagged with the
+    /// vocabulary it came from. See [`Entry::genres`] and [`Entry::subjects`].
+    pub categories: Vec<Category>,
     pub links: Vec<Link>,
 }
 
@@ -89,6 +114,22 @@ impl Entry {
     /// Human-facing web page for this publication (`rel="alternate"`), if any.
     pub fn web_link(&self) -> Option<&Link> {
         self.links.iter().find(|l| l.is_alternate())
+    }
+
+    /// Broad genre terms (e.g. "Fiction"), drawn from a genre vocabulary.
+    pub fn genres(&self) -> impl Iterator<Item = &str> {
+        self.categories
+            .iter()
+            .filter(|c| c.is_genre())
+            .map(|c| c.term.as_str())
+    }
+
+    /// Detailed subject terms (e.g. LCSH headings), excluding broad genres.
+    pub fn subjects(&self) -> impl Iterator<Item = &str> {
+        self.categories
+            .iter()
+            .filter(|c| !c.is_genre())
+            .map(|c| c.term.as_str())
     }
 }
 
@@ -243,8 +284,9 @@ fn parse_entry<F: Fn(&str) -> String>(node: &roxmltree::Node, resolve: &F) -> En
                     .or_else(|| child.attribute("term"))
                 {
                     let term = collapse_ws(term);
-                    if !term.is_empty() && !entry.categories.iter().any(|c| c == &term) {
-                        entry.categories.push(term);
+                    if !term.is_empty() && !entry.categories.iter().any(|c| c.term == term) {
+                        let scheme = child.attribute("scheme").map(str::to_string);
+                        entry.categories.push(Category { term, scheme });
                     }
                 }
             }
@@ -388,9 +430,10 @@ mod tests {
         <dc:publisher>Example Press</dc:publisher>
         <published>2024-01-02T03:04:05Z</published>
         <rights>Public domain.</rights>
-        <category scheme="x" term="Fiction"/>
-        <category scheme="y" term="Adventure" label="Adventure"/>
-        <category scheme="z" term="Fiction"/>
+        <category scheme="http://purl.org/dc/terms/LCSH" term="Fiction"/>
+        <category scheme="http://purl.org/dc/terms/LCSH" term="Adventure" label="Adventure"/>
+        <category scheme="http://purl.org/dc/terms/LCSH" term="Fiction"/>
+        <category scheme="https://standardebooks.org/vocab/subjects" term="Nonfiction"/>
         <link rel="http://opds-spec.org/image" href="/covers/1.jpg" type="image/jpeg"/>
         <link rel="http://opds-spec.org/image/thumbnail" href="/covers/1-t.jpg" type="image/jpeg"/>
         <link rel="alternate" href="/books/1" type="application/xhtml+xml"/>
@@ -446,8 +489,10 @@ mod tests {
         assert_eq!(book.publisher.as_deref(), Some("Example Press"));
         assert_eq!(book.published.as_deref(), Some("2024-01-02T03:04:05Z"));
         assert_eq!(book.rights.as_deref(), Some("Public domain."));
-        // Categories prefer label over term and are de-duplicated.
-        assert_eq!(book.categories, vec!["Fiction", "Adventure"]);
+        // Detailed subjects prefer label over term and are de-duplicated; the
+        // genre-vocabulary term is split out from the subject headings.
+        assert_eq!(book.subjects().collect::<Vec<_>>(), vec!["Fiction", "Adventure"]);
+        assert_eq!(book.genres().collect::<Vec<_>>(), vec!["Nonfiction"]);
         // Content has tags stripped, entities decoded, and paragraphs split.
         assert_eq!(
             book.content.as_deref(),
