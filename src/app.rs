@@ -235,12 +235,47 @@ pub enum Confirm {
     DeleteBook(usize),
 }
 
-/// The destinations offered by the download menu, in display order.
-pub const DOWNLOAD_DESTS: [&str; 3] = [
-    "opdsview library (readable here)",
-    "~/Downloads",
-    "Import to Calibre",
-];
+/// A place a downloaded format can be sent.
+#[derive(Clone, Copy)]
+pub enum Destination {
+    /// The opdsview library — readable in the built-in reader.
+    Library,
+    /// A loose file in `~/Downloads`.
+    Downloads,
+    /// Imported into the user's Calibre library.
+    Calibre,
+}
+
+impl Destination {
+    /// Every destination, in display order — the superset [`destinations_for`]
+    /// filters down. Also used to size the modal so its footprint is stable
+    /// across both steps.
+    const ALL: [Destination; 3] = [
+        Destination::Library,
+        Destination::Downloads,
+        Destination::Calibre,
+    ];
+
+    /// The menu label for this destination.
+    pub fn label(self) -> &'static str {
+        match self {
+            Destination::Library => "opdsview library (readable here)",
+            Destination::Downloads => "~/Downloads",
+            Destination::Calibre => "Import to Calibre",
+        }
+    }
+}
+
+/// The destinations offered for a `mime` format, in display order. The opdsview
+/// library is offered only for formats the built-in reader can open (EPUB-
+/// family) — its whole point is reading here — so other formats can only go to
+/// `~/Downloads` or Calibre.
+fn destinations_for(mime: &str) -> Vec<Destination> {
+    Destination::ALL
+        .into_iter()
+        .filter(|d| !matches!(d, Destination::Library) || is_readable_ebook(mime))
+        .collect()
+}
 
 /// Which step the download modal is showing.
 enum DownloadStage {
@@ -263,9 +298,14 @@ pub struct DownloadMenu {
     formats: Vec<crate::opds::Link>,
     /// Index into `formats` chosen in the format step.
     format: usize,
-    /// MIME types of this book's formats already saved in the local library, so
-    /// the modal can mark which formats are downloaded. Captured at open time.
-    saved_mimes: HashSet<String>,
+    /// The destinations offered for the chosen format, set on entering the
+    /// destination step (the library is dropped for unreadable formats).
+    dests: Vec<Destination>,
+    /// Acquisition URLs of this book's formats already saved in the local
+    /// library, so the modal can mark which formats are downloaded. Captured at
+    /// open time. URL-keyed (not MIME-keyed) so two same-MIME variants — e.g. a
+    /// "recommended" and an "advanced" EPUB — are told apart.
+    saved_urls: HashSet<String>,
     /// Library metadata for the book, captured once (includes scraped reading
     /// stats when on hand) so it needn't be rebuilt per format.
     meta: Box<LibraryEntry>,
@@ -279,9 +319,14 @@ impl DownloadMenu {
         &self.formats
     }
 
-    /// Whether the given format MIME type is already saved in the local library.
-    pub fn is_saved(&self, mime: &str) -> bool {
-        self.saved_mimes.contains(mime)
+    /// The destinations offered for the chosen format, for the renderer.
+    pub fn dests(&self) -> &[Destination] {
+        &self.dests
+    }
+
+    /// Whether the format at the given acquisition URL is already in the library.
+    pub fn is_saved(&self, url: &str) -> bool {
+        self.saved_urls.contains(url)
     }
 
     /// Whether the modal is on its format-selection step (vs. destination).
@@ -294,11 +339,18 @@ impl DownloadMenu {
         self.formats.get(self.format)
     }
 
+    /// The number of list rows the modal sizes to — the larger of the format
+    /// list and the full destination set — so the popup footprint is identical
+    /// across both steps (no cover cells revealed/ghosted when stepping).
+    pub fn footprint_rows(&self) -> usize {
+        self.formats.len().max(Destination::ALL.len())
+    }
+
     /// Number of rows in the current step's list, for cursor clamping.
     fn current_len(&self) -> usize {
         match self.stage {
             DownloadStage::Format => self.formats.len(),
-            DownloadStage::Destination => DOWNLOAD_DESTS.len(),
+            DownloadStage::Destination => self.dests.len(),
         }
     }
 }
@@ -448,11 +500,12 @@ pub struct App {
     /// A dismissible message popup (e.g. a download error too long for the
     /// status line). Any key closes it.
     pub notice: Option<String>,
-    /// The local library indexed by book id → its saved format MIME types, for
-    /// the catalog's book-level ("in your library") and per-format ("this format
-    /// is downloaded") markers. Refreshed when a catalog opens and after each
-    /// download.
-    pub downloaded_formats: HashMap<String, HashSet<String>>,
+    /// The local library indexed by book id → the acquisition URLs its saved
+    /// formats were downloaded from, for the catalog's book-level ("in your
+    /// library") and per-format ("this format is downloaded") markers. Keyed by
+    /// URL, not MIME, so two same-MIME variants are distinguished. Refreshed
+    /// when a catalog opens and after each download.
+    pub downloaded_sources: HashMap<String, HashSet<String>>,
     /// Match keys for books in the user's Calibre library, for the catalog's
     /// "in Calibre" markers (see [`crate::storage::calibre_index`]). Queried
     /// lazily the first time a catalog opens, and again after a Calibre import.
@@ -488,7 +541,7 @@ impl App {
             confirm: None,
             download_menu: None,
             notice: None,
-            downloaded_formats: HashMap::new(),
+            downloaded_sources: HashMap::new(),
             calibre_ids: HashSet::new(),
             calibre_loaded: false,
             status: String::new(),
@@ -1068,11 +1121,12 @@ impl App {
             self.status = "No downloadable formats for this entry".into();
             return;
         }
-        // The formats of this book already on disk, so the modal can mark them.
-        let saved_mimes = detail
+        // The acquisition URLs of this book's formats already on disk, so the
+        // modal can mark which formats are downloaded.
+        let saved_urls = detail
             .library_id
             .as_deref()
-            .and_then(|id| self.downloaded_formats.get(id))
+            .and_then(|id| self.downloaded_sources.get(id))
             .cloned()
             .unwrap_or_default();
         let cover_url = entry.image_link().map(|l| l.href.clone());
@@ -1089,7 +1143,8 @@ impl App {
             selected: 0,
             formats,
             format: 0,
-            saved_mimes,
+            dests: Vec::new(),
+            saved_urls,
             meta: Box::new(meta),
             cover_url,
             auth,
@@ -1134,6 +1189,9 @@ impl App {
         };
         if menu.choosing_format() {
             menu.format = menu.selected;
+            // Offer only the destinations that make sense for this format.
+            let mime = menu.formats.get(menu.format).map(|l| l.mime.clone());
+            menu.dests = mime.as_deref().map(destinations_for).unwrap_or_default();
             menu.stage = DownloadStage::Destination;
             menu.selected = 0;
         } else {
@@ -1150,12 +1208,16 @@ impl App {
             selected,
             formats,
             format,
+            dests,
             meta,
             cover_url,
             auth,
             ..
         } = menu;
         let Some(link) = formats.get(format) else {
+            return;
+        };
+        let Some(&choice) = dests.get(selected) else {
             return;
         };
         let url = link.href.clone();
@@ -1166,9 +1228,10 @@ impl App {
         }
         let mime = link.mime.clone();
         let length = link.length;
-        let (dest, status): (DownloadDest, &str) = match selected {
-            1 => (DownloadDest::Downloads, "Saving to ~/Downloads…"),
-            2 => (
+        let (dest, status): (DownloadDest, &str) = match choice {
+            Destination::Library => (DownloadDest::Library, "Downloading…"),
+            Destination::Downloads => (DownloadDest::Downloads, "Saving to ~/Downloads…"),
+            Destination::Calibre => (
                 DownloadDest::Calibre {
                     command: self.user.calibre.command(),
                     library_path: self.user.calibre.library_path.clone(),
@@ -1176,7 +1239,6 @@ impl App {
                 },
                 "Importing to Calibre…",
             ),
-            _ => (DownloadDest::Library, "Downloading…"),
         };
         self.downloads.insert(url.clone(), DownloadSlot::Pending);
         self.status = status.into();
@@ -1695,7 +1757,7 @@ impl App {
             Response::Library { result } => self.on_library(result),
             Response::LibraryFormats { result } => {
                 if let Ok(map) = result {
-                    self.downloaded_formats = map;
+                    self.downloaded_sources = map;
                 }
             }
             Response::CalibreIds { result } => match result {

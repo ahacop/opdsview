@@ -306,6 +306,11 @@ pub struct LibraryFile {
     pub filename: String,
     #[serde(default)]
     pub length: Option<u64>,
+    /// The acquisition URL this format was downloaded from, so a catalog can
+    /// mark the exact format (not just the MIME type) as already in the library.
+    /// Absent in sidecars written before this was tracked.
+    #[serde(default)]
+    pub source_url: Option<String>,
 }
 
 /// A persisted record of one downloaded book: its catalog metadata plus the
@@ -571,12 +576,18 @@ fn save_book_in(
     let ebook_path = dir.join(&ebook_name);
     fs::write(&ebook_path, ebook_bytes)
         .with_context(|| format!("writing {}", ebook_path.display()))?;
-    if !files.iter().any(|f| f.filename == ebook_name) {
-        files.push(LibraryFile {
-            mime: mime.to_string(),
-            filename: ebook_name,
-            length: length.or(Some(ebook_bytes.len() as u64)),
-        });
+    // Update-or-insert by filename: two formats that share an extension (e.g. a
+    // "recommended" and an "advanced" EPUB) occupy the same file, so the record
+    // reflects whichever variant was downloaded last — including its source URL.
+    let file = LibraryFile {
+        mime: mime.to_string(),
+        filename: ebook_name.clone(),
+        length: length.or(Some(ebook_bytes.len() as u64)),
+        source_url: Some(ebook_url.to_string()),
+    };
+    match files.iter_mut().find(|f| f.filename == ebook_name) {
+        Some(existing) => *existing = file,
+        None => files.push(file),
     }
 
     // Save the cover once, on the first download of this book.
@@ -680,20 +691,23 @@ fn library_ids_in(dir: &Path) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-/// Map every downloaded book's id (sidecar stem) to the set of format MIME types
-/// saved for it, so a catalog can mark which *specific* formats of a book are
-/// already in the local library — persistently, across sessions.
+/// Map every downloaded book's id (sidecar stem) to the set of acquisition URLs
+/// its saved formats were downloaded from, so a catalog can mark which *specific*
+/// formats of a book are already in the local library — persistently, across
+/// sessions. URL-keyed (not MIME-keyed) so two same-MIME variants — e.g. a
+/// "recommended" and an "advanced" EPUB — are distinguished.
 ///
 /// Unlike [`library_ids`] this parses each sidecar (for its `files`), but at the
 /// library's scale (tens–hundreds of books) that's still well under the budget
-/// noted on [`load_library`]. An unreadable or unparseable sidecar is skipped.
-/// The key set equals what [`library_ids`] would return, so callers also get the
-/// book-level "downloaded" markers from `map.contains_key(id)`.
-pub fn library_formats() -> Result<HashMap<String, HashSet<String>>> {
-    library_formats_in(&library_dir()?)
+/// noted on [`load_library`]. An unreadable or unparseable sidecar is skipped, as
+/// is any format saved before source URLs were tracked. The key set equals what
+/// [`library_ids`] would return, so callers also get the book-level "downloaded"
+/// markers from `map.contains_key(id)`.
+pub fn library_format_sources() -> Result<HashMap<String, HashSet<String>>> {
+    library_format_sources_in(&library_dir()?)
 }
 
-fn library_formats_in(dir: &Path) -> Result<HashMap<String, HashSet<String>>> {
+fn library_format_sources_in(dir: &Path) -> Result<HashMap<String, HashSet<String>>> {
     let read_dir = match fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(_) => return Ok(HashMap::new()),
@@ -711,8 +725,12 @@ fn library_formats_in(dir: &Path) -> Result<HashMap<String, HashSet<String>>> {
         let Ok(meta) = serde_json::from_slice::<LibraryEntry>(&bytes) else {
             continue;
         };
-        let mimes = meta.files.into_iter().map(|f| f.mime).collect();
-        map.insert(stem.to_string(), mimes);
+        let urls = meta
+            .files
+            .into_iter()
+            .filter_map(|f| f.source_url)
+            .collect();
+        map.insert(stem.to_string(), urls);
     }
     Ok(map)
 }
@@ -996,7 +1014,7 @@ pub fn open_in_reader(path: &Path) -> Result<()> {
 /// appended so distinct books that slug identically don't collide.
 ///
 /// Public so the catalog list can compute a candidate entry's id and check it
-/// against the [`library_formats`] index to mark already-downloaded books.
+/// against the [`library_format_sources`] index to mark already-downloaded books.
 pub fn book_id(authors: &[String], title: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -1380,11 +1398,11 @@ mod tests {
     }
 
     #[test]
-    fn library_formats_indexes_each_books_saved_mimes() {
+    fn library_format_sources_indexes_each_books_download_urls() {
         let dir = temp_dir("formats");
         // No directory yet → empty.
-        assert!(library_formats_in(&dir).unwrap().is_empty());
-        // One book saved in two formats merges into a single record.
+        assert!(library_format_sources_in(&dir).unwrap().is_empty());
+        // Two distinct formats (different extensions) both stick around.
         save_book_in(
             &dir,
             sample_meta(),
@@ -1406,14 +1424,32 @@ mod tests {
         )
         .unwrap();
 
-        let map = library_formats_in(&dir).unwrap();
+        let map = library_format_sources_in(&dir).unwrap();
         let authors = vec!["Willa Cather".to_string()];
         let id = book_id(&authors, "The Professor's House");
-        // Keyed by the same id library_ids lists, with both saved mimes.
-        let mimes = map.get(&id).expect("book indexed by id");
-        assert_eq!(mimes.len(), 2);
-        assert!(mimes.contains("application/epub+zip"));
-        assert!(mimes.contains("application/x-mobipocket-ebook"));
+        // Keyed by the same id library_ids lists, with both source URLs.
+        let urls = map.get(&id).expect("book indexed by id");
+        assert_eq!(urls.len(), 2);
+        assert!(urls.contains("https://se.org/b.epub"));
+        assert!(urls.contains("https://se.org/b.azw3"));
+
+        // Re-downloading another EPUB *variant* shares the .epub file, so the
+        // record tracks only the latest variant's URL — not both EPUBs.
+        save_book_in(
+            &dir,
+            sample_meta(),
+            "application/epub+zip",
+            None,
+            "https://se.org/b-advanced.epub",
+            b"E2",
+            None,
+        )
+        .unwrap();
+        let urls = library_format_sources_in(&dir).unwrap();
+        let urls = urls.get(&id).unwrap();
+        assert_eq!(urls.len(), 2);
+        assert!(urls.contains("https://se.org/b-advanced.epub"));
+        assert!(!urls.contains("https://se.org/b.epub"));
 
         let _ = fs::remove_dir_all(&dir);
     }

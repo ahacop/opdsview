@@ -89,7 +89,7 @@ pub enum Request {
     },
     /// Load all downloaded books from the local library.
     Library,
-    /// Index the library's books by id → saved format MIME types, for the
+    /// Index the library's books by id → their formats' source URLs, for the
     /// catalog's book-level and per-format "downloaded" markers.
     LibraryFormats,
     /// Query a Calibre library (via `calibredb list`) for the set of match keys
@@ -145,7 +145,7 @@ pub enum Response {
     Library {
         result: Result<Vec<LibraryBook>>,
     },
-    /// The library indexed by book id → its saved format MIME types.
+    /// The library indexed by book id → its formats' source acquisition URLs.
     LibraryFormats {
         result: Result<HashMap<String, HashSet<String>>>,
     },
@@ -235,7 +235,7 @@ impl Worker {
                         let _ = resp_tx.send(Response::Library { result });
                     }
                     Request::LibraryFormats => {
-                        let result = storage::library_formats();
+                        let result = storage::library_format_sources();
                         let _ = resp_tx.send(Response::LibraryFormats { result });
                     }
                     Request::CalibreIds {

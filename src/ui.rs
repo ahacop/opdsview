@@ -13,8 +13,8 @@ use ratatui::widgets::{
 use ratatui_image::StatefulImage;
 
 use crate::app::{
-    App, Backend, BrowserState, Confirm, DOWNLOAD_DESTS, DownloadMenu, DownloadSlot, FORM_LABELS,
-    FormState, ImageSlot, ReaderState, ReadingSlot, Screen,
+    App, Backend, BrowserState, Confirm, DownloadMenu, DownloadSlot, FORM_LABELS, FormState,
+    ImageSlot, ReaderState, ReadingSlot, Screen,
 };
 use crate::opds::Entry;
 use crate::reader::{Block as ContentBlock, block_height, render_chapter, search_book};
@@ -91,7 +91,7 @@ pub fn render(frame: &mut Frame, app: &mut App, show_covers: bool) {
                 &mut app.images,
                 &app.downloads,
                 &app.reading,
-                &app.downloaded_formats,
+                &app.downloaded_sources,
                 &app.calibre_ids,
                 show_covers,
             );
@@ -722,8 +722,9 @@ fn render_detail_page(
     // the formats are informational here (a format is chosen in the download
     // modal), so no row is highlighted.
     let selected = matches!(b.backend, Backend::Library(_)).then_some(detail.format);
-    // The formats of this book already saved locally, to mark them as downloaded.
-    let saved_mimes = detail
+    // The acquisition URLs of this book's formats already saved locally, to mark
+    // the exact formats as downloaded.
+    let saved_urls = detail
         .library_id
         .as_deref()
         .and_then(|id| downloaded.get(id));
@@ -733,7 +734,7 @@ fn render_detail_page(
         &acquisitions,
         selected,
         downloads,
-        saved_mimes,
+        saved_urls,
     );
 }
 
@@ -818,7 +819,7 @@ fn render_detail_formats(
     links: &[&crate::opds::Link],
     selected: Option<usize>,
     downloads: &HashMap<String, DownloadSlot>,
-    saved_mimes: Option<&HashSet<String>>,
+    saved_urls: Option<&HashSet<String>>,
 ) {
     let block = Block::default().borders(Borders::TOP).title(Span::styled(
         " Download ",
@@ -848,7 +849,7 @@ fn render_detail_formats(
             } else {
                 Style::default()
             };
-            let already = saved_mimes.is_some_and(|s| s.contains(&link.mime));
+            let already = saved_urls.is_some_and(|s| s.contains(&link.href));
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{marker}{}", format_label(link)), style),
                 download_status_span(downloads.get(&link.href), already),
@@ -1222,10 +1223,9 @@ fn render_download_menu(
     menu: &DownloadMenu,
     downloads: &HashMap<String, DownloadSlot>,
 ) {
-    // Size to the longer of the two lists so the footprint is identical on both
-    // steps (see the doc comment above).
-    let list_len = menu.formats().len().max(DOWNLOAD_DESTS.len()) as u16;
-    let rows = (list_len + 2).clamp(3, area.height.max(3));
+    // Size to the larger of the two steps' lists so the footprint is identical on
+    // both steps (see the doc comment above).
+    let rows = (menu.footprint_rows() as u16 + 2).clamp(3, area.height.max(3));
     let popup = centered_rect(60, rows, area);
     frame.render_widget(Clear, popup);
 
@@ -1234,7 +1234,7 @@ fn render_download_menu(
             .formats()
             .iter()
             .map(|link| {
-                let already = menu.is_saved(&link.mime);
+                let already = menu.is_saved(&link.href);
                 ListItem::new(Line::from(vec![
                     Span::raw(format_label(link)),
                     download_status_span(downloads.get(&link.href), already),
@@ -1247,9 +1247,10 @@ fn render_download_menu(
             .chosen_format()
             .map(|l| pretty_mime(&l.mime))
             .unwrap_or("");
-        let items = DOWNLOAD_DESTS
+        let items = menu
+            .dests()
             .iter()
-            .map(|d| ListItem::new(Line::from(d.to_string())))
+            .map(|d| ListItem::new(Line::from(d.label().to_string())))
             .collect();
         (format!(" Download {fmt} to "), items)
     };
