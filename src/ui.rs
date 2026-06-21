@@ -23,6 +23,11 @@ use crate::worker::Request;
 
 const ACCENT: Color = Color::Cyan;
 
+/// Rows of context kept between the list cursor and the top/bottom edge, so the
+/// viewport scrolls a few rows early instead of pinning the selection to the
+/// border (degrades gracefully when the list is shorter than the viewport).
+const LIST_SCROLL_PADDING: usize = 3;
+
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let chunks = Layout::default()
@@ -217,6 +222,7 @@ fn render_feed_list(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let list = List::new(items)
         .block(block)
+        .scroll_padding(LIST_SCROLL_PADDING)
         .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(list, area, &mut app.feed_list);
@@ -367,6 +373,7 @@ fn render_entry_list(
 
     let list = List::new(items)
         .block(block)
+        .scroll_padding(LIST_SCROLL_PADDING)
         .highlight_style(
             Style::default()
                 .bg(ACCENT)
