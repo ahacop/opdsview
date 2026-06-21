@@ -5,6 +5,8 @@ feeds), written in Rust with [ratatui](https://ratatui.rs/). Add feeds — inclu
 ones behind HTTP Basic Auth — explore them interactively, view cover art inline,
 and have responses cached locally.
 
+![opdsview browsing a catalog with an inline cover and publication detail](docs/screenshot.png)
+
 ## Features
 
 - **Manage feeds from the UI** — add, edit, and delete OPDS catalogs without
