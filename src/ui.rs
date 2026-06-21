@@ -26,7 +26,7 @@ const ACCENT: Color = Color::Cyan;
 /// Rows of context kept between the list cursor and the top/bottom edge, so the
 /// viewport scrolls a few rows early instead of pinning the selection to the
 /// border (degrades gracefully when the list is shorter than the viewport).
-const LIST_SCROLL_PADDING: usize = 3;
+const LIST_SCROLL_PADDING: usize = 5;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
