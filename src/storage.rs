@@ -1,6 +1,7 @@
 //! Persistence of the saved-feed list, the downloaded-book library, and
 //! on-disk locations.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,7 +9,7 @@ use anyhow::{Context, Result};
 use directories::{ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
 
-use crate::opds::{Author, Category, Entry, Link, REL_ACQUISITION, REL_IMAGE};
+use crate::opds::{Author, Category, Entry, Link, REL_ACQUISITION, REL_IMAGE, identifier_token};
 use crate::reading::ReadingStats;
 
 /// A saved OPDS catalog, including optional HTTP Basic Auth credentials.
@@ -218,6 +219,12 @@ pub struct LibraryEntry {
     /// URI was unknown). Absent in sidecars written before author links existed.
     #[serde(default)]
     pub author_uris: Vec<String>,
+    /// The catalog entry's Atom `<id>`, when known (often a `urn:` identifier).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// `<dc:identifier>` values (ISBNs, URNs) carried over from the catalog.
+    #[serde(default)]
+    pub identifiers: Vec<String>,
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
@@ -261,6 +268,8 @@ impl LibraryEntry {
                 .iter()
                 .map(|a| a.uri.clone().unwrap_or_default())
                 .collect(),
+            id: entry.id.clone(),
+            identifiers: entry.identifiers.clone(),
             summary: entry.summary.clone(),
             content: entry.content.clone(),
             language: entry.language.clone(),
@@ -379,6 +388,8 @@ fn library_to_entry(dir: &Path, meta: &LibraryEntry) -> Entry {
                 uri: meta.author_uris.get(i).filter(|u| !u.is_empty()).cloned(),
             })
             .collect(),
+        id: meta.id.clone(),
+        identifiers: meta.identifiers.clone(),
         summary: meta.summary.clone(),
         content: meta.content.clone(),
         language: meta.language.clone(),
@@ -564,6 +575,156 @@ fn library_ids_in(dir: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(ids)
+}
+
+// --- Calibre library status ----------------------------------------------
+
+/// One book as reported by `calibredb list`, reduced to the fields used for
+/// matching a catalog entry: its title, authors, and identifier tokens.
+struct CalibreBook {
+    title: String,
+    authors: Vec<String>,
+    tokens: Vec<String>,
+}
+
+/// Build a set of match keys for the books in a Calibre library by shelling out
+/// to `calibredb list`.
+///
+/// Each book contributes a [`book_id`] slug (first author + title) and one
+/// `scheme:value` key per identifier ([`identifier_token`] — `isbn:…`, `url:…`,
+/// …), so a catalog entry can be marked "in Calibre" either by a shared
+/// identifier ([`in_calibre_index`]) or, when no identifier is available on both
+/// sides, by a fuzzy author+title slug. The identifier path matters most for
+/// Standard Ebooks, which carry no ISBN but a stable `url:` identifier.
+///
+/// `library_path` is passed as `--library-path`; it may be an on-disk library or
+/// a running content server URL (the latter avoids the lock held by an open
+/// Calibre GUI), mirroring [`import_to_calibre`].
+pub fn calibre_index(command: &str, library_path: Option<&str>) -> Result<HashSet<String>> {
+    let mut cmd = std::process::Command::new(command);
+    cmd.arg("list")
+        .arg("--for-machine")
+        .arg("--fields")
+        .arg("title,authors,identifiers");
+    if let Some(lib) = library_path.filter(|l| !l.trim().is_empty()) {
+        cmd.arg("--library-path").arg(lib);
+    }
+    let output = cmd
+        .output()
+        .with_context(|| format!("running {command} list"))?;
+    if !output.status.success() {
+        let detail = squish(&String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!("{command} list failed ({}): {detail}", output.status);
+    }
+    let books = parse_calibre_list(&String::from_utf8_lossy(&output.stdout))?;
+    Ok(calibre_match_keys(&books))
+}
+
+/// Parse the JSON array emitted by `calibredb list --for-machine`.
+///
+/// Only `title`, `authors`, and `identifiers` are read. `authors` is a
+/// `" & "`-joined display string; `identifiers` is either a JSON object
+/// (`{"isbn": "…"}`) or, on older calibredb, a comma-separated `key:value`
+/// string — both shapes are handled.
+fn parse_calibre_list(json: &str) -> Result<Vec<CalibreBook>> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).context("parsing calibredb list output as JSON")?;
+    let array = value
+        .as_array()
+        .context("calibredb list did not return a JSON array")?;
+    let books = array
+        .iter()
+        .map(|item| {
+            let title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let authors = item
+                .get("authors")
+                .and_then(|v| v.as_str())
+                .map(|s| {
+                    s.split(" & ")
+                        .map(|a| a.trim().to_string())
+                        .filter(|a| !a.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let tokens = calibre_tokens(item.get("identifiers"));
+            CalibreBook {
+                title,
+                authors,
+                tokens,
+            }
+        })
+        .collect();
+    Ok(books)
+}
+
+/// Extract canonical identifier tokens from a calibredb `identifiers` field,
+/// accepting both the JSON-object (`{"isbn": "…", "url": "…"}`) and the legacy
+/// comma-separated-string (`isbn:…,url:…`) encodings.
+fn calibre_tokens(identifiers: Option<&serde_json::Value>) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut add = |token: Option<String>| {
+        if let Some(token) = token
+            && !tokens.contains(&token)
+        {
+            tokens.push(token);
+        }
+    };
+    match identifiers {
+        Some(serde_json::Value::Object(map)) => {
+            for (scheme, value) in map {
+                if let Some(s) = value.as_str() {
+                    add(identifier_token(scheme, s));
+                }
+            }
+        }
+        Some(serde_json::Value::String(s)) => {
+            for pair in s.split(',') {
+                if let Some((scheme, value)) = pair.split_once(':') {
+                    add(identifier_token(scheme, value));
+                }
+            }
+        }
+        _ => {}
+    }
+    tokens
+}
+
+/// Reduce parsed Calibre books to the set of match keys (see [`calibre_index`]).
+fn calibre_match_keys(books: &[CalibreBook]) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for book in books {
+        if !book.title.is_empty() {
+            keys.insert(book_id(&book.authors, &book.title));
+        }
+        keys.extend(book.tokens.iter().cloned());
+    }
+    keys
+}
+
+/// Whether a catalog book is present in the Calibre index from [`calibre_index`].
+///
+/// A match by a shared identifier token (`isbn:…`, `url:…`) is preferred — it is
+/// reliable across metadata variations and is the only sound key for Standard
+/// Ebooks (URL-identified, no ISBN). Failing that, the first-author+title slug is
+/// compared, the same fuzzy key the "downloaded" markers use. An empty index
+/// (Calibre unconfigured or unreadable) never matches.
+pub fn in_calibre_index(
+    index: &HashSet<String>,
+    authors: &[String],
+    title: &str,
+    tokens: &[String],
+) -> bool {
+    if index.is_empty() {
+        return false;
+    }
+    if tokens.iter().any(|token| index.contains(token)) {
+        return true;
+    }
+    index.contains(&book_id(authors, title))
 }
 
 /// Save a downloaded ebook as a plain file in `dir` (no sidecar, no cover), for
@@ -1039,6 +1200,68 @@ mod tests {
             library_ids_in(&dir).unwrap(),
             vec![book_id(&authors, "The Professor's House")]
         );
+    }
+
+    #[test]
+    fn calibre_index_matches_by_identifier_and_by_author_title() {
+        // Three books: an ISBN-identified one, a Standard Ebooks one identified
+        // only by URL, and one with no usable identifier.
+        let json = r#"[
+            {"title": "The Professor's House", "authors": "Willa Cather",
+             "identifiers": {"isbn": "978-0-306-40615-7", "google": "abc"}},
+            {"title": "Romola", "authors": "George Eliot",
+             "identifiers": {"url": "https://standardebooks.org/ebooks/george-eliot/romola"}},
+            {"title": "My Antonia", "authors": "Willa Cather & Someone Else",
+             "identifiers": {}}
+        ]"#;
+        let books = parse_calibre_list(json).unwrap();
+        assert_eq!(books.len(), 3);
+        assert_eq!(books[2].authors, vec!["Willa Cather", "Someone Else"]);
+        let index = calibre_match_keys(&books);
+
+        let cather = vec!["Willa Cather".to_string()];
+        // Matched by shared ISBN even though the title/author differ in spelling.
+        assert!(in_calibre_index(
+            &index,
+            &["Different Name".to_string()],
+            "Totally Different Title",
+            &["isbn:9780306406157".to_string()],
+        ));
+        // A Standard Ebooks entry matches by its URL token (it has no ISBN), even
+        // with a differently-formatted author — the whole point of URL matching.
+        assert!(in_calibre_index(
+            &index,
+            &["Eliot, George".to_string()],
+            "Romola",
+            &["url:https://standardebooks.org/ebooks/george-eliot/romola".to_string()],
+        ));
+        // Matched by first-author + title when no identifier is shared.
+        assert!(in_calibre_index(&index, &cather, "My Antonia", &[]));
+        // A book that's in neither set is not matched.
+        assert!(!in_calibre_index(&index, &cather, "O Pioneers!", &[]));
+    }
+
+    #[test]
+    fn calibre_index_handles_legacy_string_identifiers() {
+        // Older calibredb encodes identifiers as a comma-separated string; a URL
+        // value contains its own colons, which split_once must not mangle.
+        let json = r#"[{"title": "T", "authors": "A",
+            "identifiers": "isbn:0306406152,url:https://standardebooks.org/ebooks/a/b"}]"#;
+        let books = parse_calibre_list(json).unwrap();
+        assert_eq!(
+            books[0].tokens,
+            vec![
+                "isbn:0306406152".to_string(),
+                "url:https://standardebooks.org/ebooks/a/b".to_string(),
+            ]
+        );
+        let index = calibre_match_keys(&books);
+        assert!(in_calibre_index(
+            &index,
+            &["X".to_string()],
+            "Y",
+            &["url:https://standardebooks.org/ebooks/a/b".to_string()],
+        ));
     }
 
     #[test]

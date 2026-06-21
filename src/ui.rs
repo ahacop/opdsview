@@ -83,6 +83,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 &app.downloads,
                 &app.reading,
                 &app.downloaded_ids,
+                &app.calibre_ids,
             );
             render_help(frame, chunks[2], help);
         }
@@ -282,12 +283,13 @@ fn render_browser(
     downloads: &HashMap<String, DownloadSlot>,
     reading: &HashMap<String, ReadingSlot>,
     downloaded: &HashSet<String>,
+    calibre: &HashSet<String>,
 ) {
     let Screen::Browser(b) = screen else { return };
 
     // The detail "show page" takes over the whole browser area when open.
     if b.detail.is_some() {
-        render_detail_page(frame, area, b, images, downloads, reading);
+        render_detail_page(frame, area, b, images, downloads, reading, calibre);
         return;
     }
 
@@ -296,7 +298,7 @@ fn render_browser(
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
-    render_entry_list(frame, panes[0], b, downloaded);
+    render_entry_list(frame, panes[0], b, downloaded, calibre);
     render_detail(frame, panes[1], b, images, reading);
 }
 
@@ -305,6 +307,7 @@ fn render_entry_list(
     area: Rect,
     b: &BrowserState,
     downloaded: &HashSet<String>,
+    calibre: &HashSet<String>,
 ) {
     let title = format!(" {} ", crumb_path(b));
     let block = Block::default()
@@ -347,23 +350,18 @@ fn render_entry_list(
         return;
     }
 
-    // Only a remote catalog gets "downloaded" markers; in the library every
-    // book is by definition already downloaded.
-    let mark_downloaded = matches!(b.backend, Backend::Opds(_));
+    // Only a remote catalog gets library/Calibre status markers; in the local
+    // library every book is by definition already downloaded.
+    let mark_status = matches!(b.backend, Backend::Opds(_));
     let items: Vec<ListItem> = entries
         .iter()
         .map(|e| {
-            let (marker, color) = if e.is_navigation() {
-                ("▸ ", ACCENT)
-            } else if mark_downloaded && is_downloaded(e, downloaded) {
-                ("✓ ", Color::Green)
-            } else {
-                ("• ", Color::Reset)
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(marker, Style::default().fg(color)),
-                Span::raw(e.title.clone()),
-            ]))
+            ListItem::new(Line::from(entry_row_spans(
+                e,
+                mark_status,
+                downloaded,
+                calibre,
+            )))
         })
         .collect();
 
@@ -380,6 +378,39 @@ fn render_entry_list(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// Build the spans for one entry's list row: a status gutter then the title.
+///
+/// For catalog entries (`status`) the gutter is two independent slots — the
+/// local opdsview library (green ✓) and Calibre (cyan ◆) — so a book in both
+/// shows both, rather than one state hiding the other. Navigation entries get an
+/// accent ▸; local-library rows (no status, every book is already downloaded)
+/// get a plain bullet.
+fn entry_row_spans(
+    entry: &Entry,
+    status: bool,
+    downloaded: &HashSet<String>,
+    calibre: &HashSet<String>,
+) -> Vec<Span<'static>> {
+    let title = Span::raw(entry.title.clone());
+    if entry.is_navigation() {
+        return vec![Span::styled("▸  ", Style::default().fg(ACCENT)), title];
+    }
+    if !status {
+        return vec![Span::styled("• ", Style::default().fg(Color::Reset)), title];
+    }
+    let lib = if is_downloaded(entry, downloaded) {
+        Span::styled("✓", Style::default().fg(Color::Green))
+    } else {
+        Span::raw(" ")
+    };
+    let cal = if is_in_calibre(entry, calibre) {
+        Span::styled("◆", Style::default().fg(Color::Cyan))
+    } else {
+        Span::raw(" ")
+    };
+    vec![lib, cal, Span::raw(" "), title]
+}
+
 /// Whether a catalog entry's book is already in the local library, found by
 /// matching its computed id against the set of downloaded ids.
 fn is_downloaded(entry: &Entry, downloaded: &HashSet<String>) -> bool {
@@ -388,6 +419,17 @@ fn is_downloaded(entry: &Entry, downloaded: &HashSet<String>) -> bool {
     }
     let authors: Vec<String> = entry.author_names().map(str::to_string).collect();
     downloaded.contains(&crate::storage::book_id(&authors, &entry.title))
+}
+
+/// Whether a catalog entry's book is present in the user's Calibre library,
+/// matched by a shared identifier (ISBN or URL) or, failing that, author+title
+/// (see [`crate::storage::in_calibre_index`]).
+fn is_in_calibre(entry: &Entry, calibre: &HashSet<String>) -> bool {
+    if calibre.is_empty() {
+        return false;
+    }
+    let authors: Vec<String> = entry.author_names().map(str::to_string).collect();
+    crate::storage::in_calibre_index(calibre, &authors, &entry.title, &entry.identifier_tokens())
 }
 
 fn render_detail(
@@ -603,6 +645,7 @@ fn render_detail_page(
     images: &mut HashMap<String, ImageSlot>,
     downloads: &HashMap<String, DownloadSlot>,
     reading: &HashMap<String, ReadingSlot>,
+    calibre: &HashSet<String>,
 ) {
     let Some(entry) = b.detail_entry() else {
         return;
@@ -647,6 +690,7 @@ fn render_detail_page(
         entry,
         reading_slot,
         detail.library_id.is_some(),
+        is_in_calibre(entry, calibre),
     );
     render_detail_formats(frame, right[1], &acquisitions, detail.format, downloads);
 }
@@ -657,6 +701,7 @@ fn render_detail_info(
     entry: &Entry,
     reading: Option<&ReadingSlot>,
     in_library: bool,
+    in_calibre: bool,
 ) {
     let mut lines = vec![Line::from(Span::styled(
         entry.title.clone(),
@@ -695,6 +740,14 @@ fn render_detail_info(
             "✓ In your library — press g to open your downloaded copy",
             Style::default()
                 .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    if in_calibre {
+        lines.push(Line::from(Span::styled(
+            "◆ In your Calibre library",
+            Style::default()
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
     }

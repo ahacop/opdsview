@@ -72,6 +72,12 @@ pub struct Author {
 pub struct Entry {
     pub title: String,
     pub authors: Vec<Author>,
+    /// The Atom `<id>` of this entry — a stable identifier (often a `urn:uuid:`,
+    /// `urn:isbn:`, or tag URI). Used, with `identifiers`, to match a catalog
+    /// book against an external library (e.g. Calibre) by shared identifier.
+    pub id: Option<String>,
+    /// `<dc:identifier>` values: ISBNs, URNs, or URIs naming this publication.
+    pub identifiers: Vec<String>,
     /// Short plain-text blurb (`<summary>`).
     pub summary: Option<String>,
     /// Long description (`<content>`), with HTML markup stripped.
@@ -145,6 +151,118 @@ impl Entry {
             .filter(|c| !c.is_genre())
             .map(|c| c.term.as_str())
     }
+
+    /// Normalized ISBNs drawn from this entry's `<id>` and `<dc:identifier>`
+    /// values, de-duplicated. Lets a catalog book be matched against an external
+    /// library by a stable identifier rather than fuzzy title+author.
+    pub fn isbns(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let candidates = self
+            .id
+            .iter()
+            .map(String::as_str)
+            .chain(self.identifiers.iter().map(String::as_str));
+        for s in candidates {
+            if let Some(isbn) = normalize_isbn(s)
+                && !out.contains(&isbn)
+            {
+                out.push(isbn);
+            }
+        }
+        out
+    }
+
+    /// Identifier tokens for this entry in the canonical `scheme:value` form
+    /// ([`identifier_token`]), drawn from `<id>` and `<dc:identifier>`,
+    /// de-duplicated. These match a catalog book against an external library by
+    /// any shared identifier — for Standard Ebooks, the stable per-book URL,
+    /// which Calibre stores as a `url:` identifier and which beats fuzzy
+    /// title+author matching.
+    pub fn identifier_tokens(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for raw in self.id.iter().chain(self.identifiers.iter()) {
+            if let Some(token) = raw_identifier_token(raw)
+                && !out.contains(&token)
+            {
+                out.push(token);
+            }
+        }
+        out
+    }
+}
+
+/// Normalize an ISBN-like string to bare characters (digits plus an optional
+/// trailing check `X`), or `None` if it isn't a 10- or 13-character ISBN.
+///
+/// Strips a leading `urn:isbn:` or `isbn:` prefix (any case), removes hyphens
+/// and whitespace, and uppercases the check digit, so the many ways feeds and
+/// Calibre spell the same ISBN collapse to one comparable form.
+pub(crate) fn normalize_isbn(s: &str) -> Option<String> {
+    let mut core = s.trim();
+    for prefix in ["urn:isbn:", "isbn:"] {
+        if let Some(head) = core.get(..prefix.len())
+            && head.eq_ignore_ascii_case(prefix)
+        {
+            core = &core[prefix.len()..];
+            break;
+        }
+    }
+    let cleaned: String = core
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let len_ok = cleaned.len() == 10 || cleaned.len() == 13;
+    let last = cleaned.len().saturating_sub(1);
+    let chars_ok = cleaned
+        .chars()
+        .enumerate()
+        .all(|(i, c)| c.is_ascii_digit() || (c == 'X' && i == last));
+    (len_ok && chars_ok && !cleaned.is_empty()).then_some(cleaned)
+}
+
+/// Canonicalize a `(scheme, value)` identifier pair into a token comparable
+/// across an OPDS feed and a Calibre library — e.g. `isbn:9780306406157`,
+/// `url:https://standardebooks.org/ebooks/willa-cather/the-professors-house`.
+///
+/// ISBNs are normalized via [`normalize_isbn`]; URL values lose a trailing
+/// slash; the scheme is lowercased. Returns `None` for empty values.
+pub(crate) fn identifier_token(scheme: &str, value: &str) -> Option<String> {
+    let scheme = scheme.trim().to_ascii_lowercase();
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    match scheme.as_str() {
+        "isbn" => normalize_isbn(value).map(|isbn| format!("isbn:{isbn}")),
+        "url" => Some(format!("url:{}", value.trim_end_matches('/'))),
+        "" => None,
+        _ => Some(format!("{scheme}:{value}")),
+    }
+}
+
+/// Derive an identifier token from a raw OPDS `<id>`/`<dc:identifier>` string,
+/// inferring its scheme.
+///
+/// Recognizes ISBNs (in any of the usual `urn:isbn:` / `isbn:` / bare spellings),
+/// absolute URLs (Standard Ebooks' stable per-book URL — its `<id>` and
+/// `<dc:identifier>` are exactly that URL, which Calibre stores as `url:`), and an
+/// explicit `url:<href>` prefix. Other shapes (uuids, `tag:` URIs) are ignored,
+/// since they don't reliably correspond to a Calibre identifier.
+pub(crate) fn raw_identifier_token(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if let Some(isbn) = normalize_isbn(s) {
+        return Some(format!("isbn:{isbn}"));
+    }
+    if s.starts_with("http://") || s.starts_with("https://") {
+        return identifier_token("url", s);
+    }
+    if let Some(head) = s.get(..4)
+        && head.eq_ignore_ascii_case("url:")
+    {
+        return identifier_token("url", &s[4..]);
+    }
+    None
 }
 
 /// A parsed OPDS feed.
@@ -290,6 +408,15 @@ fn parse_entry<F: Fn(&str) -> String>(node: &roxmltree::Node, resolve: &F) -> En
         // `dc:language` or `dc:issued` are picked up regardless of prefix.
         match local_name(&child) {
             "title" => entry.title = text_of(&child),
+            "id" => set_if_empty(&mut entry.id, text_of(&child)),
+            // `<dc:identifier>` (local name "identifier") may appear more than
+            // once: ISBN, a URN, a permalink. Keep each distinct value.
+            "identifier" => {
+                let value = text_of(&child);
+                if !value.is_empty() && !entry.identifiers.contains(&value) {
+                    entry.identifiers.push(value);
+                }
+            }
             "summary" => set_if_empty(&mut entry.summary, text_of(&child)),
             "content" => set_if_empty(&mut entry.content, strip_html(&text_of(&child))),
             "language" => set_if_empty(&mut entry.language, text_of(&child)),
@@ -450,6 +577,9 @@ mod tests {
       </entry>
       <entry>
         <title>A Great Book</title>
+        <id>urn:uuid:3f2a9c1e-0000-4000-8000-000000000001</id>
+        <dc:identifier>urn:isbn:978-0-306-40615-7</dc:identifier>
+        <dc:identifier>https://example.com/books/1</dc:identifier>
         <author><name>Jane Doe</name><uri>https://example.com/authors/jane-doe</uri></author>
         <summary>A thrilling tale.</summary>
         <content type="html">&lt;p&gt;First paragraph &amp;amp; more.&lt;/p&gt; &lt;p&gt;Second paragraph.&lt;/p&gt;</content>
@@ -534,6 +664,72 @@ mod tests {
         );
         // The alternate link points at the publication's web page.
         assert_eq!(book.web_link().unwrap().href, "https://example.com/books/1");
+        // The Atom id and dc:identifier are captured; the ISBN (hyphenated, urn-
+        // prefixed) normalizes to bare digits, while the uuid id is not an ISBN.
+        assert_eq!(
+            book.id.as_deref(),
+            Some("urn:uuid:3f2a9c1e-0000-4000-8000-000000000001")
+        );
+        assert_eq!(
+            book.identifiers,
+            vec!["urn:isbn:978-0-306-40615-7", "https://example.com/books/1"]
+        );
+        assert_eq!(book.isbns(), vec!["9780306406157".to_string()]);
+        // Tokens skip the non-matching uuid id and carry both the ISBN and the
+        // URL (the latter is how Standard Ebooks books match a Calibre `url:`).
+        assert_eq!(
+            book.identifier_tokens(),
+            vec![
+                "isbn:9780306406157".to_string(),
+                "url:https://example.com/books/1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn identifier_tokens_canonicalize_scheme_and_value() {
+        // A trailing slash on a URL is dropped so both sides compare equal.
+        assert_eq!(
+            identifier_token("URL", "https://standardebooks.org/ebooks/x/y/"),
+            Some("url:https://standardebooks.org/ebooks/x/y".to_string())
+        );
+        assert_eq!(
+            identifier_token("isbn", "978-0-306-40615-7"),
+            Some("isbn:9780306406157".to_string())
+        );
+        // A bare SE URL infers the `url` scheme; an explicit `url:` prefix works too.
+        assert_eq!(
+            raw_identifier_token("https://standardebooks.org/ebooks/a/b"),
+            Some("url:https://standardebooks.org/ebooks/a/b".to_string())
+        );
+        assert_eq!(
+            raw_identifier_token("url:https://standardebooks.org/ebooks/a/b"),
+            Some("url:https://standardebooks.org/ebooks/a/b".to_string())
+        );
+        // Uuids and tag URIs don't map to a Calibre identifier and are ignored.
+        assert!(raw_identifier_token("urn:uuid:3f2a9c1e-0000-4000-8000-000000000001").is_none());
+    }
+
+    #[test]
+    fn normalizes_isbns_and_rejects_non_isbns() {
+        assert_eq!(
+            normalize_isbn("urn:isbn:978-0-306-40615-7").as_deref(),
+            Some("9780306406157")
+        );
+        assert_eq!(
+            normalize_isbn("ISBN:0306406152").as_deref(),
+            Some("0306406152")
+        );
+        assert_eq!(
+            normalize_isbn("0-19-852663-6").as_deref(),
+            Some("0198526636")
+        );
+        // A trailing check 'X' is kept and uppercased.
+        assert_eq!(normalize_isbn("097522980x").as_deref(), Some("097522980X"));
+        // Non-ISBN identifiers (uuid, plain words, wrong length) are rejected.
+        assert!(normalize_isbn("urn:uuid:3f2a9c1e-0000-4000-8000-000000000001").is_none());
+        assert!(normalize_isbn("https://example.com/books/1").is_none());
+        assert!(normalize_isbn("12345").is_none());
     }
 
     #[test]

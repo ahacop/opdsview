@@ -3,6 +3,7 @@
 //! All HTTP I/O and image decoding happens on a dedicated thread so the UI
 //! event loop never blocks. Requests and responses are exchanged over channels.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
@@ -81,6 +82,12 @@ pub enum Request {
     /// List the ids of books in the library (for the catalog's "downloaded"
     /// markers) without parsing every sidecar.
     LibraryIds,
+    /// Query a Calibre library (via `calibredb list`) for the set of match keys
+    /// used to mark catalog books already present in Calibre.
+    CalibreIds {
+        command: String,
+        library_path: Option<String>,
+    },
     /// Run an OpenSearch query: resolve the description at `desc_url`, then
     /// fetch the resulting acquisition feed.
     Search {
@@ -129,6 +136,10 @@ pub enum Response {
     /// The ids of books currently in the library.
     LibraryIds {
         result: Result<Vec<String>>,
+    },
+    /// The Calibre-library match keys (see [`Request::CalibreIds`]).
+    CalibreIds {
+        result: Result<HashSet<String>>,
     },
     /// A search result: the resolved feed URL and its parsed feed.
     Search {
@@ -203,6 +214,13 @@ impl Worker {
                     Request::LibraryIds => {
                         let result = storage::library_ids();
                         let _ = resp_tx.send(Response::LibraryIds { result });
+                    }
+                    Request::CalibreIds {
+                        command,
+                        library_path,
+                    } => {
+                        let result = storage::calibre_index(&command, library_path.as_deref());
+                        let _ = resp_tx.send(Response::CalibreIds { result });
                     }
                     Request::Search {
                         desc_url,

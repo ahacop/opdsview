@@ -333,6 +333,50 @@ fn focus_match(r: &mut ReaderState) {
     }
 }
 
+/// A short status-line hint for a failed Calibre query, or `None` when the
+/// failure is just "calibredb isn't installed" — in that case the user isn't
+/// using Calibre and shouldn't be nagged on every catalog open.
+///
+/// Formatted with `{err:#}` so the source chain (the OS "No such file" error, or
+/// calibredb's lock message on stderr) is included; the top-level `Display`
+/// alone would omit it.
+fn calibre_error_hint(err: &anyhow::Error) -> Option<String> {
+    let detail = format!("{err:#}");
+    let lower = detail.to_lowercase();
+    if lower.contains("no such file")
+        || lower.contains("not found")
+        || lower.contains("cannot find")
+    {
+        return None;
+    }
+    if lower.contains("another")
+        || lower.contains("is running")
+        || lower.contains("locked")
+        || lower.contains("in use")
+    {
+        return Some(
+            "Calibre library looks locked (desktop app open?). Point calibre.library_path at the content-server URL to read it while the GUI runs."
+                .to_string(),
+        );
+    }
+    Some(format!(
+        "Couldn't read Calibre library: {}",
+        squish_line(&detail)
+    ))
+}
+
+/// Collapse whitespace and truncate so a hint fits on one status line.
+fn squish_line(s: &str) -> String {
+    let squished = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if squished.chars().count() > 120 {
+        let mut truncated: String = squished.chars().take(117).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        squished
+    }
+}
+
 pub struct App {
     pub config: Config,
     pub screen: Screen,
@@ -347,6 +391,14 @@ pub struct App {
     /// Ids of books in the local library, for the catalog's "downloaded"
     /// markers. Refreshed when a catalog opens and after each download.
     pub downloaded_ids: HashSet<String>,
+    /// Match keys for books in the user's Calibre library, for the catalog's
+    /// "in Calibre" markers (see [`crate::storage::calibre_index`]). Queried
+    /// lazily the first time a catalog opens, and again after a Calibre import.
+    pub calibre_ids: HashSet<String>,
+    /// Whether the Calibre index has been queried this session; gates the lazy
+    /// (and potentially slow) `calibredb list` to one run unless an import
+    /// invalidates it.
+    pub calibre_loaded: bool,
     pub status: String,
     pub should_quit: bool,
     /// Outgoing network requests, drained by the main loop after each update.
@@ -372,6 +424,8 @@ impl App {
             download_menu: None,
             notice: None,
             downloaded_ids: HashSet::new(),
+            calibre_ids: HashSet::new(),
+            calibre_loaded: false,
             status: String::new(),
             should_quit: false,
             outbox: Vec::new(),
@@ -704,6 +758,20 @@ impl App {
         self.outbox.push(Request::Feed { url, auth });
         // Refresh the set of downloaded books so the list can mark them.
         self.outbox.push(Request::LibraryIds);
+        // Query Calibre once per session so the list can mark books already in
+        // the user's Calibre library; refreshed after an import.
+        if !self.calibre_loaded {
+            let req = self.calibre_ids_request();
+            self.outbox.push(req);
+        }
+    }
+
+    /// Build a request to (re)query the configured Calibre library's match keys.
+    fn calibre_ids_request(&self) -> Request {
+        Request::CalibreIds {
+            command: self.config.calibre.command(),
+            library_path: self.config.calibre.library_path.clone(),
+        }
     }
 
     /// Open the local downloaded-book library. When `open_target` is `Some`, the
@@ -1477,6 +1545,15 @@ impl App {
                     self.mark_detail_downloaded(&url);
                     self.outbox.push(Request::LibraryIds);
                 }
+                // A successful Calibre import changes what's in Calibre, so
+                // refresh the "in Calibre" markers.
+                if matches!(
+                    (&slot, kind),
+                    (DownloadSlot::Done(_), DownloadKind::Calibre)
+                ) {
+                    let req = self.calibre_ids_request();
+                    self.outbox.push(req);
+                }
                 self.downloads.insert(url, slot);
             }
             Response::Search { query, result } => self.on_search(query, result),
@@ -1493,6 +1570,22 @@ impl App {
                     self.downloaded_ids = ids.into_iter().collect();
                 }
             }
+            Response::CalibreIds { result } => match result {
+                Ok(ids) => {
+                    self.calibre_loaded = true;
+                    self.calibre_ids = ids.into_iter().collect();
+                }
+                Err(err) => {
+                    // Leave `calibre_loaded` false so the next catalog open
+                    // retries — a transient failure (e.g. the library briefly
+                    // locked by the Calibre GUI) can then self-heal. Surface a
+                    // hint for the lock case instead of failing silently; stay
+                    // quiet when calibredb simply isn't installed.
+                    if let Some(hint) = calibre_error_hint(&err) {
+                        self.status = hint;
+                    }
+                }
+            },
             Response::Book { result } => self.on_book(result),
         }
     }
