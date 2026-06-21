@@ -65,7 +65,9 @@ pub struct Crumb {
 pub struct DetailState {
     /// Index of the entry within the current feed.
     pub entry_index: usize,
-    /// Index of the highlighted acquisition format.
+    /// Index of the highlighted acquisition format. Only meaningful for the
+    /// local library (where ↑↓ picks the format to read/open); the catalog
+    /// download flow chooses a format in the [`DownloadMenu`] modal instead.
     pub format: usize,
     /// When viewing a catalog publication that's already in the local library,
     /// its library id — lets the user jump to the downloaded copy. `None` for
@@ -240,23 +242,65 @@ pub const DOWNLOAD_DESTS: [&str; 3] = [
     "Import to Calibre",
 ];
 
-/// Everything the worker needs to download one acquisition link, captured when
-/// the download menu opens so confirming a destination needs no further lookup.
-struct PendingDownload {
+/// Which step the download modal is showing.
+enum DownloadStage {
+    /// Choosing which format to download.
+    Format,
+    /// Choosing where the chosen format is saved.
+    Destination,
+}
+
+/// The open download modal. A single overlay that walks two steps — pick a
+/// format, then pick a destination — without ever closing in between, so the
+/// flow is one popup rather than two opening and closing over each other. The
+/// book metadata and request context shared by every format are captured when
+/// it opens, so dispatching needs no further lookup of the entry.
+pub struct DownloadMenu {
+    stage: DownloadStage,
+    /// Highlighted row within the current step's list.
+    pub selected: usize,
+    /// The entry's acquisition links, in display order.
+    formats: Vec<crate::opds::Link>,
+    /// Index into `formats` chosen in the format step.
+    format: usize,
+    /// MIME types of this book's formats already saved in the local library, so
+    /// the modal can mark which formats are downloaded. Captured at open time.
+    saved_mimes: HashSet<String>,
+    /// Library metadata for the book, captured once (includes scraped reading
+    /// stats when on hand) so it needn't be rebuilt per format.
     meta: Box<LibraryEntry>,
-    url: String,
-    mime: String,
-    length: Option<u64>,
     cover_url: Option<String>,
     auth: Auth,
 }
 
-/// The open "choose a download destination" menu.
-pub struct DownloadMenu {
-    /// Highlighted row, an index into [`DOWNLOAD_DESTS`].
-    pub selected: usize,
-    /// The download to dispatch once a destination is chosen.
-    pending: PendingDownload,
+impl DownloadMenu {
+    /// The downloadable formats, for the modal's renderer.
+    pub fn formats(&self) -> &[crate::opds::Link] {
+        &self.formats
+    }
+
+    /// Whether the given format MIME type is already saved in the local library.
+    pub fn is_saved(&self, mime: &str) -> bool {
+        self.saved_mimes.contains(mime)
+    }
+
+    /// Whether the modal is on its format-selection step (vs. destination).
+    pub fn choosing_format(&self) -> bool {
+        matches!(self.stage, DownloadStage::Format)
+    }
+
+    /// The format picked in the first step, shown in the destination step.
+    pub fn chosen_format(&self) -> Option<&crate::opds::Link> {
+        self.formats.get(self.format)
+    }
+
+    /// Number of rows in the current step's list, for cursor clamping.
+    fn current_len(&self) -> usize {
+        match self.stage {
+            DownloadStage::Format => self.formats.len(),
+            DownloadStage::Destination => DOWNLOAD_DESTS.len(),
+        }
+    }
 }
 
 /// In-book string search state for the reader.
@@ -399,14 +443,16 @@ pub struct App {
     pub feed_list: ListState,
     /// A pending confirmation popup (delete feed / delete book), if open.
     pub confirm: Option<Confirm>,
-    /// The open download-destination menu, if any.
+    /// The open download modal (format then destination), if any.
     pub download_menu: Option<DownloadMenu>,
     /// A dismissible message popup (e.g. a download error too long for the
     /// status line). Any key closes it.
     pub notice: Option<String>,
-    /// Ids of books in the local library, for the catalog's "downloaded"
-    /// markers. Refreshed when a catalog opens and after each download.
-    pub downloaded_ids: HashSet<String>,
+    /// The local library indexed by book id → its saved format MIME types, for
+    /// the catalog's book-level ("in your library") and per-format ("this format
+    /// is downloaded") markers. Refreshed when a catalog opens and after each
+    /// download.
+    pub downloaded_formats: HashMap<String, HashSet<String>>,
     /// Match keys for books in the user's Calibre library, for the catalog's
     /// "in Calibre" markers (see [`crate::storage::calibre_index`]). Queried
     /// lazily the first time a catalog opens, and again after a Calibre import.
@@ -442,7 +488,7 @@ impl App {
             confirm: None,
             download_menu: None,
             notice: None,
-            downloaded_ids: HashSet::new(),
+            downloaded_formats: HashMap::new(),
             calibre_ids: HashSet::new(),
             calibre_loaded: false,
             status: String::new(),
@@ -496,7 +542,7 @@ impl App {
             self.handle_confirm_key(key);
             return;
         }
-        // The download-destination menu likewise intercepts all keys.
+        // The download modal likewise intercepts all keys.
         if self.download_menu.is_some() {
             self.handle_download_menu_key(key);
             return;
@@ -789,8 +835,8 @@ impl App {
         };
         self.screen = Screen::Browser(Box::new(browser));
         self.outbox.push(Request::Feed { url, auth });
-        // Refresh the set of downloaded books so the list can mark them.
-        self.outbox.push(Request::LibraryIds);
+        // Refresh the downloaded-format index so the list can mark them.
+        self.outbox.push(Request::LibraryFormats);
         // Query Calibre once per session so the list can mark books already in
         // the user's Calibre library; refreshed after an import.
         if !self.calibre_loaded {
@@ -932,26 +978,28 @@ impl App {
             | KeyCode::Backspace => {
                 b.detail = None;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            // ↑↓ pick the format to read/open — library only; the catalog
+            // download flow chooses its format in the modal opened below.
+            KeyCode::Char('j') | KeyCode::Down if library => {
                 if formats > 0 {
                     detail.format = (detail.format + 1).min(formats - 1);
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Char('k') | KeyCode::Up if library => {
                 detail.format = detail.format.saturating_sub(1);
             }
             // In the library, Enter/o opens the built-in reader (falling back to
-            // the external opener for non-EPUB formats); in a catalog they
-            // download the selected format.
+            // the external opener for non-EPUB formats); in a catalog they open
+            // the download modal (format, then destination).
             KeyCode::Enter | KeyCode::Char('o') => {
                 if library {
                     self.open_reader();
                 } else {
-                    self.activate_selected_format();
+                    self.open_download_menu();
                 }
             }
             // Catalog: download. Library: force-open in the external OS reader.
-            KeyCode::Char('d') if !library => self.activate_selected_format(),
+            KeyCode::Char('d') if !library => self.open_download_menu(),
             KeyCode::Char('x') if library => self.open_selected_format(),
             KeyCode::Char('g') => self.jump_to_downloaded(),
             _ => {}
@@ -998,22 +1046,10 @@ impl App {
         }
     }
 
-    /// Act on the highlighted format: download it (OPDS) or open it (library).
-    fn activate_selected_format(&mut self) {
-        let is_library = matches!(
-            &self.screen,
-            Screen::Browser(b) if matches!(b.backend, Backend::Library(_))
-        );
-        if is_library {
-            self.open_selected_format();
-        } else {
-            self.download_selected_format();
-        }
-    }
-
-    /// Open the destination menu for the format highlighted in the detail view,
-    /// gathering the metadata the worker will need once a destination is picked.
-    fn download_selected_format(&mut self) {
+    /// Open the download modal for the catalog book whose detail is showing,
+    /// capturing the book metadata the download will need so stepping through
+    /// the format and destination choices needs no further lookup of the entry.
+    fn open_download_menu(&mut self) {
         let Screen::Browser(b) = &self.screen else {
             return;
         };
@@ -1027,17 +1063,18 @@ impl App {
         else {
             return;
         };
-        let Some(link) = entry.acquisition_links().nth(detail.format) else {
-            return;
-        };
-        let url = link.href.clone();
-        // Don't re-queue a download that's already running.
-        if matches!(self.downloads.get(&url), Some(DownloadSlot::Pending)) {
-            self.status = "Already downloading…".into();
+        let formats: Vec<crate::opds::Link> = entry.acquisition_links().cloned().collect();
+        if formats.is_empty() {
+            self.status = "No downloadable formats for this entry".into();
             return;
         }
-        let mime = link.mime.clone();
-        let length = link.length;
+        // The formats of this book already on disk, so the modal can mark them.
+        let saved_mimes = detail
+            .library_id
+            .as_deref()
+            .and_then(|id| self.downloaded_formats.get(id))
+            .cloned()
+            .unwrap_or_default();
         let cover_url = entry.image_link().map(|l| l.href.clone());
         let mut meta = LibraryEntry::from_entry(entry);
         // Attach scraped reading metrics if we have them on hand.
@@ -1048,42 +1085,88 @@ impl App {
         }
         let auth = b.auth();
         self.download_menu = Some(DownloadMenu {
+            stage: DownloadStage::Format,
             selected: 0,
-            pending: PendingDownload {
-                meta: Box::new(meta),
-                url,
-                mime,
-                length,
-                cover_url,
-                auth,
-            },
+            formats,
+            format: 0,
+            saved_mimes,
+            meta: Box::new(meta),
+            cover_url,
+            auth,
         });
     }
 
-    /// Key handling while the download-destination menu is open.
+    /// Key handling while the download modal is open.
     fn handle_download_menu_key(&mut self, key: KeyEvent) {
         let Some(menu) = self.download_menu.as_mut() else {
             return;
         };
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.download_menu = None,
+            // Step back to format selection, or close from the first step.
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+                if menu.choosing_format() {
+                    self.download_menu = None;
+                } else {
+                    menu.stage = DownloadStage::Format;
+                    menu.selected = menu.format;
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => {
-                menu.selected = (menu.selected + 1).min(DOWNLOAD_DESTS.len() - 1);
+                let len = menu.current_len();
+                if len > 0 {
+                    menu.selected = (menu.selected + 1).min(len - 1);
+                }
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 menu.selected = menu.selected.saturating_sub(1);
             }
-            KeyCode::Enter | KeyCode::Char('l') => self.confirm_download(),
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.advance_download_menu(),
             _ => {}
         }
     }
 
-    /// Dispatch the pending download to the destination highlighted in the menu.
-    fn confirm_download(&mut self) {
+    /// Advance the modal one step: format choice → destination choice, or
+    /// destination choice → dispatch the download.
+    fn advance_download_menu(&mut self) {
+        let Some(menu) = self.download_menu.as_mut() else {
+            return;
+        };
+        if menu.choosing_format() {
+            menu.format = menu.selected;
+            menu.stage = DownloadStage::Destination;
+            menu.selected = 0;
+        } else {
+            self.dispatch_download();
+        }
+    }
+
+    /// Dispatch the chosen format to the chosen destination and close the modal.
+    fn dispatch_download(&mut self) {
         let Some(menu) = self.download_menu.take() else {
             return;
         };
-        let (dest, status): (DownloadDest, &str) = match menu.selected {
+        let DownloadMenu {
+            selected,
+            formats,
+            format,
+            meta,
+            cover_url,
+            auth,
+            ..
+        } = menu;
+        let Some(link) = formats.get(format) else {
+            return;
+        };
+        let url = link.href.clone();
+        // Don't re-queue a download that's already running.
+        if matches!(self.downloads.get(&url), Some(DownloadSlot::Pending)) {
+            self.status = "Already downloading…".into();
+            return;
+        }
+        let mime = link.mime.clone();
+        let length = link.length;
+        let (dest, status): (DownloadDest, &str) = match selected {
             1 => (DownloadDest::Downloads, "Saving to ~/Downloads…"),
             2 => (
                 DownloadDest::Calibre {
@@ -1095,14 +1178,6 @@ impl App {
             ),
             _ => (DownloadDest::Library, "Downloading…"),
         };
-        let PendingDownload {
-            meta,
-            url,
-            mime,
-            length,
-            cover_url,
-            auth,
-        } = menu.pending;
         self.downloads.insert(url.clone(), DownloadSlot::Pending);
         self.status = status.into();
         self.outbox.push(Request::Download {
@@ -1596,7 +1671,7 @@ impl App {
                     (DownloadSlot::Done(_), DownloadKind::Library)
                 ) {
                     self.mark_detail_downloaded(&url);
-                    self.outbox.push(Request::LibraryIds);
+                    self.outbox.push(Request::LibraryFormats);
                 }
                 // A successful Calibre import changes what's in Calibre, so
                 // refresh the "in Calibre" markers.
@@ -1618,9 +1693,9 @@ impl App {
                 self.reading.insert(url, slot);
             }
             Response::Library { result } => self.on_library(result),
-            Response::LibraryIds { result } => {
-                if let Ok(ids) = result {
-                    self.downloaded_ids = ids.into_iter().collect();
+            Response::LibraryFormats { result } => {
+                if let Ok(map) = result {
+                    self.downloaded_formats = map;
                 }
             }
             Response::CalibreIds { result } => match result {

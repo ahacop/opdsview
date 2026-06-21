@@ -1,7 +1,7 @@
 //! Persistence of the saved-feed list, the downloaded-book library, and
 //! on-disk locations.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -680,6 +680,43 @@ fn library_ids_in(dir: &Path) -> Result<Vec<String>> {
     Ok(ids)
 }
 
+/// Map every downloaded book's id (sidecar stem) to the set of format MIME types
+/// saved for it, so a catalog can mark which *specific* formats of a book are
+/// already in the local library — persistently, across sessions.
+///
+/// Unlike [`library_ids`] this parses each sidecar (for its `files`), but at the
+/// library's scale (tens–hundreds of books) that's still well under the budget
+/// noted on [`load_library`]. An unreadable or unparseable sidecar is skipped.
+/// The key set equals what [`library_ids`] would return, so callers also get the
+/// book-level "downloaded" markers from `map.contains_key(id)`.
+pub fn library_formats() -> Result<HashMap<String, HashSet<String>>> {
+    library_formats_in(&library_dir()?)
+}
+
+fn library_formats_in(dir: &Path) -> Result<HashMap<String, HashSet<String>>> {
+    let read_dir = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(HashMap::new()),
+    };
+    let mut map = HashMap::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let Ok(meta) = serde_json::from_slice::<LibraryEntry>(&bytes) else {
+            continue;
+        };
+        let mimes = meta.files.into_iter().map(|f| f.mime).collect();
+        map.insert(stem.to_string(), mimes);
+    }
+    Ok(map)
+}
+
 // --- Calibre library status ----------------------------------------------
 
 /// One book as reported by `calibredb list`, reduced to the fields used for
@@ -959,7 +996,7 @@ pub fn open_in_reader(path: &Path) -> Result<()> {
 /// appended so distinct books that slug identically don't collide.
 ///
 /// Public so the catalog list can compute a candidate entry's id and check it
-/// against [`library_ids`] to mark already-downloaded books.
+/// against the [`library_formats`] index to mark already-downloaded books.
 pub fn book_id(authors: &[String], title: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -1340,6 +1377,45 @@ mod tests {
             library_ids_in(&dir).unwrap(),
             vec![book_id(&authors, "The Professor's House")]
         );
+    }
+
+    #[test]
+    fn library_formats_indexes_each_books_saved_mimes() {
+        let dir = temp_dir("formats");
+        // No directory yet → empty.
+        assert!(library_formats_in(&dir).unwrap().is_empty());
+        // One book saved in two formats merges into a single record.
+        save_book_in(
+            &dir,
+            sample_meta(),
+            "application/epub+zip",
+            None,
+            "https://se.org/b.epub",
+            b"E",
+            None,
+        )
+        .unwrap();
+        save_book_in(
+            &dir,
+            sample_meta(),
+            "application/x-mobipocket-ebook",
+            None,
+            "https://se.org/b.azw3",
+            b"A",
+            None,
+        )
+        .unwrap();
+
+        let map = library_formats_in(&dir).unwrap();
+        let authors = vec!["Willa Cather".to_string()];
+        let id = book_id(&authors, "The Professor's House");
+        // Keyed by the same id library_ids lists, with both saved mimes.
+        let mimes = map.get(&id).expect("book indexed by id");
+        assert_eq!(mimes.len(), 2);
+        assert!(mimes.contains("application/epub+zip"));
+        assert!(mimes.contains("application/x-mobipocket-ebook"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

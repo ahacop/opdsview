@@ -75,9 +75,9 @@ pub fn render(frame: &mut Frame, app: &mut App, show_covers: bool) {
                     .and_then(|d| d.library_id.as_ref())
                     .is_some()
                 {
-                    "↑↓ format   Enter/d download…   g open copy   ⌫/h/Esc back"
+                    "Enter/d download…   g open copy   ⌫/h/Esc back"
                 } else {
-                    "↑↓ format   Enter/d download…   ⌫/h/Esc back"
+                    "Enter/d download…   ⌫/h/Esc back"
                 }
             } else if library {
                 "↑↓ move   Enter open   / search   d delete   ⌫/h clear   q feeds"
@@ -91,7 +91,7 @@ pub fn render(frame: &mut Frame, app: &mut App, show_covers: bool) {
                 &mut app.images,
                 &app.downloads,
                 &app.reading,
-                &app.downloaded_ids,
+                &app.downloaded_formats,
                 &app.calibre_ids,
                 show_covers,
             );
@@ -128,12 +128,13 @@ pub fn render(frame: &mut Frame, app: &mut App, show_covers: bool) {
     }
 
     if let Some(menu) = &app.download_menu {
-        render_download_menu(frame, area, menu);
-        render_help(
-            frame,
-            chunks[2],
-            "↑↓ choose destination   Enter confirm   Esc cancel",
-        );
+        render_download_menu(frame, area, menu, &app.downloads);
+        let help = if menu.choosing_format() {
+            "↑↓ choose format   Enter next   Esc cancel"
+        } else {
+            "↑↓ choose destination   Enter download   ⌫ back   Esc cancel"
+        };
+        render_help(frame, chunks[2], help);
     }
 
     if let Some(msg) = &app.notice {
@@ -293,7 +294,7 @@ fn render_browser(
     images: &mut HashMap<String, ImageSlot>,
     downloads: &HashMap<String, DownloadSlot>,
     reading: &HashMap<String, ReadingSlot>,
-    downloaded: &HashSet<String>,
+    downloaded: &HashMap<String, HashSet<String>>,
     calibre: &HashSet<String>,
     show_covers: bool,
 ) {
@@ -302,7 +303,9 @@ fn render_browser(
     // The detail "show page" takes over the whole browser area when open. It's a
     // focused single-book view, never fast-scrolled, so its cover always draws.
     if b.detail.is_some() {
-        render_detail_page(frame, area, b, images, downloads, reading, calibre);
+        render_detail_page(
+            frame, area, b, images, downloads, reading, downloaded, calibre,
+        );
         return;
     }
 
@@ -319,7 +322,7 @@ fn render_entry_list(
     frame: &mut Frame,
     area: Rect,
     b: &BrowserState,
-    downloaded: &HashSet<String>,
+    downloaded: &HashMap<String, HashSet<String>>,
     calibre: &HashSet<String>,
 ) {
     let title = format!(" {} ", crumb_path(b));
@@ -402,7 +405,7 @@ fn render_entry_list(
 fn entry_row_spans(
     entry: &Entry,
     status: bool,
-    downloaded: &HashSet<String>,
+    downloaded: &HashMap<String, HashSet<String>>,
     calibre: &HashSet<String>,
 ) -> Vec<Span<'static>> {
     let title = Span::raw(entry.title.clone());
@@ -426,13 +429,13 @@ fn entry_row_spans(
 }
 
 /// Whether a catalog entry's book is already in the local library, found by
-/// matching its computed id against the set of downloaded ids.
-fn is_downloaded(entry: &Entry, downloaded: &HashSet<String>) -> bool {
+/// matching its computed id against the downloaded-format index's keys.
+fn is_downloaded(entry: &Entry, downloaded: &HashMap<String, HashSet<String>>) -> bool {
     if downloaded.is_empty() {
         return false;
     }
     let authors: Vec<String> = entry.author_names().map(str::to_string).collect();
-    downloaded.contains(&crate::storage::book_id(&authors, &entry.title))
+    downloaded.contains_key(&crate::storage::book_id(&authors, &entry.title))
 }
 
 /// Whether a catalog entry's book is present in the user's Calibre library,
@@ -659,6 +662,7 @@ fn meta_line(label: &str, value: String) -> Line<'static> {
 
 // --- Detail "show page" --------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn render_detail_page(
     frame: &mut Frame,
     area: Rect,
@@ -666,6 +670,7 @@ fn render_detail_page(
     images: &mut HashMap<String, ImageSlot>,
     downloads: &HashMap<String, DownloadSlot>,
     reading: &HashMap<String, ReadingSlot>,
+    downloaded: &HashMap<String, HashSet<String>>,
     calibre: &HashSet<String>,
 ) {
     let Some(entry) = b.detail_entry() else {
@@ -713,7 +718,23 @@ fn render_detail_page(
         detail.library_id.is_some(),
         is_in_calibre(entry, calibre),
     );
-    render_detail_formats(frame, right[1], &acquisitions, detail.format, downloads);
+    // In the library ↑↓ highlights the format to read/open; for a catalog book
+    // the formats are informational here (a format is chosen in the download
+    // modal), so no row is highlighted.
+    let selected = matches!(b.backend, Backend::Library(_)).then_some(detail.format);
+    // The formats of this book already saved locally, to mark them as downloaded.
+    let saved_mimes = detail
+        .library_id
+        .as_deref()
+        .and_then(|id| downloaded.get(id));
+    render_detail_formats(
+        frame,
+        right[1],
+        &acquisitions,
+        selected,
+        downloads,
+        saved_mimes,
+    );
 }
 
 fn render_detail_info(
@@ -786,12 +807,18 @@ fn render_detail_info(
     frame.render_widget(p, area);
 }
 
+/// The bottom "Download" pane of a detail page: the entry's acquisition
+/// formats. `selected` is `Some(i)` in the local library, where ↑↓ highlights
+/// the format to read/open; for a catalog book it is `None` — the formats are
+/// shown only as information, since the format to download is chosen in the
+/// download modal (see [`render_download_menu`]).
 fn render_detail_formats(
     frame: &mut Frame,
     area: Rect,
     links: &[&crate::opds::Link],
-    selected: usize,
+    selected: Option<usize>,
     downloads: &HashMap<String, DownloadSlot>,
+    saved_mimes: Option<&HashSet<String>>,
 ) {
     let block = Block::default().borders(Borders::TOP).title(Span::styled(
         " Download ",
@@ -808,32 +835,45 @@ fn render_detail_formats(
         .iter()
         .enumerate()
         .map(|(i, link)| {
-            let marker = if i == selected { "▸ " } else { "  " };
-            let status = match downloads.get(&link.href) {
-                Some(DownloadSlot::Pending) => {
-                    Span::styled("  ↓ downloading…", Style::default().fg(Color::Yellow))
-                }
-                Some(DownloadSlot::Done(_)) => {
-                    Span::styled("  ✓ saved", Style::default().fg(Color::Green))
-                }
-                Some(DownloadSlot::Failed(_)) => {
-                    Span::styled("  ✗ failed", Style::default().fg(Color::Red))
-                }
-                None => Span::raw(""),
+            let highlighted = selected == Some(i);
+            // Interactive (library) rows get a ▸ cursor; a catalog's static list
+            // gets a plain bullet.
+            let marker = match selected {
+                Some(_) if highlighted => "▸ ",
+                Some(_) => "  ",
+                None => "• ",
             };
-            let style = if i == selected {
+            let style = if highlighted {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
+            let already = saved_mimes.is_some_and(|s| s.contains(&link.mime));
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{marker}{}", format_label(link)), style),
-                status,
+                download_status_span(downloads.get(&link.href), already),
             ]))
         })
         .collect();
 
     frame.render_widget(List::new(items).block(block), area);
+}
+
+/// A short, colored suffix describing an acquisition link's download state: live
+/// session activity (downloading / just-saved / failed) takes precedence;
+/// otherwise `already` marks a format that is persistently in the local library.
+fn download_status_span(slot: Option<&DownloadSlot>, already: bool) -> Span<'static> {
+    match slot {
+        Some(DownloadSlot::Pending) => {
+            Span::styled("  ↓ downloading…", Style::default().fg(Color::Yellow))
+        }
+        Some(DownloadSlot::Done(_)) => Span::styled("  ✓ saved", Style::default().fg(Color::Green)),
+        Some(DownloadSlot::Failed(_)) => {
+            Span::styled("  ✗ failed", Style::default().fg(Color::Red))
+        }
+        None if already => Span::styled("  ✓ in library", Style::default().fg(Color::Green)),
+        None => Span::raw(""),
+    }
 }
 
 // --- Reader --------------------------------------------------------------
@@ -1172,20 +1212,53 @@ fn render_confirm_delete(frame: &mut Frame, area: Rect, app: &App, confirm: &Con
     frame.render_widget(text, popup);
 }
 
-/// A centered menu for choosing where the highlighted format is saved.
-fn render_download_menu(frame: &mut Frame, area: Rect, menu: &DownloadMenu) {
-    let rows = DOWNLOAD_DESTS.len() as u16 + 2;
-    let popup = centered_rect(50, rows, area);
+/// The unified download modal: one centered popup that walks two steps —
+/// choosing a format, then a destination. Both steps render at the same popup
+/// footprint so stepping between them never reveals (and ghosts) cells of the
+/// cover image underneath; the popup is cleared only when the whole flow ends.
+fn render_download_menu(
+    frame: &mut Frame,
+    area: Rect,
+    menu: &DownloadMenu,
+    downloads: &HashMap<String, DownloadSlot>,
+) {
+    // Size to the longer of the two lists so the footprint is identical on both
+    // steps (see the doc comment above).
+    let list_len = menu.formats().len().max(DOWNLOAD_DESTS.len()) as u16;
+    let rows = (list_len + 2).clamp(3, area.height.max(3));
+    let popup = centered_rect(60, rows, area);
     frame.render_widget(Clear, popup);
+
+    let (title, items): (String, Vec<ListItem>) = if menu.choosing_format() {
+        let items = menu
+            .formats()
+            .iter()
+            .map(|link| {
+                let already = menu.is_saved(&link.mime);
+                ListItem::new(Line::from(vec![
+                    Span::raw(format_label(link)),
+                    download_status_span(downloads.get(&link.href), already),
+                ]))
+            })
+            .collect();
+        (" Choose a format ".to_string(), items)
+    } else {
+        let fmt = menu
+            .chosen_format()
+            .map(|l| pretty_mime(&l.mime))
+            .unwrap_or("");
+        let items = DOWNLOAD_DESTS
+            .iter()
+            .map(|d| ListItem::new(Line::from(d.to_string())))
+            .collect();
+        (format!(" Download {fmt} to "), items)
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
-        .title(" Download to ");
-    let items: Vec<ListItem> = DOWNLOAD_DESTS
-        .iter()
-        .map(|d| ListItem::new(Line::from(d.to_string())))
-        .collect();
+        .title(title);
     let list = List::new(items)
         .block(block)
         .highlight_style(

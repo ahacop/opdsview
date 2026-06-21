@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
+use ratatui::layout::Rect;
 use ratatui_image::picker::Picker;
 
 use opdsview::app::{App, is_ctrl_c};
@@ -101,10 +102,20 @@ fn run(
 
     loop {
         // A popup painted over a graphics-protocol image leaves its cells behind
-        // when it closes; a full clear forces the image to be re-emitted.
+        // when it closes; a full redraw forces the image to be re-emitted.
+        //
+        // NOT `terminal.clear()`: that snapshots the cursor via
+        // `crossterm::cursor::position()`, whose CPR reply is read straight from
+        // stdin — which our input-reader thread is *also* blocked reading, so it
+        // steals the reply and the query times out ("The cursor position could
+        // not be read within a normal duration"), returning an error that
+        // crashes the app. `Terminal::resize` to the current size resets the
+        // back buffer and clears the screen — the same full redraw — but for a
+        // fullscreen viewport it never reads the cursor.
         let overlay = app.has_overlay();
         if had_overlay && !overlay {
-            terminal.clear()?;
+            let size = terminal.size()?;
+            terminal.resize(Rect::new(0, 0, size.width, size.height))?;
         }
         had_overlay = overlay;
 

@@ -3,7 +3,7 @@
 //! All HTTP I/O and image decoding happens on a dedicated thread so the UI
 //! event loop never blocks. Requests and responses are exchanged over channels.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -89,9 +89,9 @@ pub enum Request {
     },
     /// Load all downloaded books from the local library.
     Library,
-    /// List the ids of books in the library (for the catalog's "downloaded"
-    /// markers) without parsing every sidecar.
-    LibraryIds,
+    /// Index the library's books by id → saved format MIME types, for the
+    /// catalog's book-level and per-format "downloaded" markers.
+    LibraryFormats,
     /// Query a Calibre library (via `calibredb list`) for the set of match keys
     /// used to mark catalog books already present in Calibre.
     CalibreIds {
@@ -145,9 +145,9 @@ pub enum Response {
     Library {
         result: Result<Vec<LibraryBook>>,
     },
-    /// The ids of books currently in the library.
-    LibraryIds {
-        result: Result<Vec<String>>,
+    /// The library indexed by book id → its saved format MIME types.
+    LibraryFormats {
+        result: Result<HashMap<String, HashSet<String>>>,
     },
     /// The Calibre-library match keys (see [`Request::CalibreIds`]).
     CalibreIds {
@@ -234,9 +234,9 @@ impl Worker {
                         let result = storage::load_library();
                         let _ = resp_tx.send(Response::Library { result });
                     }
-                    Request::LibraryIds => {
-                        let result = storage::library_ids();
-                        let _ = resp_tx.send(Response::LibraryIds { result });
+                    Request::LibraryFormats => {
+                        let result = storage::library_formats();
+                        let _ = resp_tx.send(Response::LibraryFormats { result });
                     }
                     Request::CalibreIds {
                         command,
