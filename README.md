@@ -185,3 +185,33 @@ cargo test          # parser unit tests
 cargo clippy        # lints
 cargo run --example parse_feed -- <opds-url>   # fetch + parse a live feed
 ```
+
+## Releasing
+
+Releases are built and published by [cargo-dist](https://opensource.axo.dev/cargo-dist/)
+(`.github/workflows/release.yml`, configured in `dist-workspace.toml`). Pushing a
+`v*` tag builds binaries for macOS (arm64) and Linux (arm64/x86-64), creates a
+GitHub Release with notes from `CHANGELOG.md`, and publishes the `opdsview`
+formula to [ahacop/homebrew-tap](https://github.com/ahacop/homebrew-tap).
+
+One-time setup: the Homebrew publish job pushes to a *different* repo, so the
+default `GITHUB_TOKEN` is not enough — add a repo secret `HOMEBREW_TAP_TOKEN`
+(a PAT with `contents: write` on `ahacop/homebrew-tap`).
+
+To cut a release:
+
+1. Record what changed under `## [Unreleased]` in `CHANGELOG.md`.
+2. Run the release helper, which validates the `[Unreleased]` section, moves it
+   under the new version + today's date, bumps `Cargo.toml`/`Cargo.lock`, then
+   commits and tags:
+
+   ```sh
+   ./scripts/release          # bump patch (e.g. 0.1.1 -> 0.1.2)
+   ./scripts/release 0.2.0    # or pass an explicit version
+   ```
+
+3. Push to trigger the release:
+
+   ```sh
+   git push origin main --tags
+   ```
