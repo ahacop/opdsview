@@ -1,9 +1,9 @@
 # opdsview
 
-A terminal UI for browsing [OPDS](https://opds.io/) catalogs (e-book/comic
-feeds), written in Rust with [ratatui](https://ratatui.rs/). Add feeds — including
-ones behind HTTP Basic Auth — explore them interactively, view cover art inline,
-and have responses cached locally.
+A terminal UI for browsing and reading [OPDS](https://opds.io/) e-book catalogs,
+written in Rust with [ratatui](https://ratatui.rs/). Add catalog feeds, browse
+and search them with cover art rendered inline, download books, and read
+downloaded EPUBs in a built-in reader — all without leaving the terminal.
 
 ![opdsview browsing a catalog with an inline cover and publication detail](docs/screenshot.png)
 
