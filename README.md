@@ -110,25 +110,26 @@ Paths follow the platform conventions (via the `directories` crate):
 
 ## Configuration
 
-Feeds and settings live in `feeds.json` in the config directory
-(e.g. `~/.config/opdsview/feeds.json` on Linux). Feeds are managed from the UI,
-but the rest is edited by hand. Every key is optional and falls back to the
-default shown above, so you only set what you want to change. A leading `~/` in
-a path is expanded to your home directory.
+Saved feeds live in `feeds.json` and are managed entirely from the UI. Everything
+else is configured in `config.toml`, which sits next to it in the config directory
+(e.g. `~/.config/opdsview/config.toml` on Linux). This file is yours to edit —
+opdsview only ever reads it — and is optional: without it, every setting uses the
+default shown under [Storage locations](#storage-locations) above.
 
-```json
-{
-  "settings": {
-    "library_dir": "~/Books/opdsview",
-    "cache_dir": "~/.cache/opdsview",
-    "download_dir": "~/Downloads"
-  },
-  "calibre": {
-    "command": "calibredb",
-    "library_path": "~/Calibre Library",
-    "automerge": "ignore"
-  }
-}
+Create it only if you want to change something. Every key is optional, so you can
+set just the ones you care about. A leading `~/` in a path expands to your home
+directory.
+
+```toml
+[settings]
+library_dir  = "~/Books/opdsview"   # where the built-in library stores books
+cache_dir    = "~/.cache/opdsview"  # where feed XML and cover images are cached
+download_dir = "~/Downloads"        # where the "~/Downloads" destination saves
+
+[calibre]
+command      = "calibredb"          # the calibredb executable
+library_path = "~/Calibre Library"  # the Calibre library to import into
+automerge    = "ignore"             # merge mode for an existing title+author
 ```
 
 - **`settings.library_dir`** — where the built-in library keeps downloaded books.

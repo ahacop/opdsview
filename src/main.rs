@@ -8,15 +8,16 @@ use ratatui_image::picker::Picker;
 
 use opdsview::app::{App, is_ctrl_c};
 use opdsview::cache::Cache;
-use opdsview::storage::{self, Config, cache_dir};
+use opdsview::storage::{self, Config, UserConfig, cache_dir};
 use opdsview::ui;
 use opdsview::worker::Worker;
 
 fn main() -> Result<()> {
     let config = Config::load()?;
+    let user_config = UserConfig::load()?;
     // Install the user's path overrides before anything resolves a directory
     // (the cache below, and the worker thread once spawned).
-    storage::install_settings(config.settings.clone());
+    storage::install_settings(user_config.settings.clone());
     let cache = Cache::new(cache_dir()?)?;
     let worker = Worker::spawn(cache)?;
 
@@ -24,7 +25,7 @@ fn main() -> Result<()> {
     // Falls back to Unicode half-blocks, which render in any terminal.
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 
-    let mut app = App::new(config, picker);
+    let mut app = App::new(config, user_config, picker);
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app, &worker);

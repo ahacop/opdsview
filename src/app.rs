@@ -11,7 +11,9 @@ use ratatui_image::protocol::StatefulProtocol;
 use crate::opds::{Entry, Feed};
 use crate::reader::{Block, BookContent};
 use crate::reading::ReadingStats;
-use crate::storage::{Config, Feed as FeedConfig, LibraryBook, LibraryEntry, ReadingProgress};
+use crate::storage::{
+    Config, Feed as FeedConfig, LibraryBook, LibraryEntry, ReadingProgress, UserConfig,
+};
 use crate::worker::{DownloadDest, DownloadKind, Request, Response};
 
 type Auth = Option<(String, String)>;
@@ -379,6 +381,8 @@ fn squish_line(s: &str) -> String {
 
 pub struct App {
     pub config: Config,
+    /// Hand-edited user configuration (paths, Calibre) from `config.toml`.
+    pub user: UserConfig,
     pub screen: Screen,
     pub feed_list: ListState,
     /// A pending confirmation popup (delete feed / delete book), if open.
@@ -412,12 +416,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config, picker: Picker) -> Self {
+    pub fn new(config: Config, user: UserConfig, picker: Picker) -> Self {
         let mut feed_list = ListState::default();
         // Row 0 is always the pinned "Downloaded books" library entry.
         feed_list.select(Some(0));
         App {
             config,
+            user,
             screen: Screen::FeedList,
             feed_list,
             confirm: None,
@@ -769,8 +774,8 @@ impl App {
     /// Build a request to (re)query the configured Calibre library's match keys.
     fn calibre_ids_request(&self) -> Request {
         Request::CalibreIds {
-            command: self.config.calibre.command(),
-            library_path: self.config.calibre.library_path.clone(),
+            command: self.user.calibre.command(),
+            library_path: self.user.calibre.library_path.clone(),
         }
     }
 
@@ -1054,9 +1059,9 @@ impl App {
             1 => (DownloadDest::Downloads, "Saving to ~/Downloads…"),
             2 => (
                 DownloadDest::Calibre {
-                    command: self.config.calibre.command(),
-                    library_path: self.config.calibre.library_path.clone(),
-                    automerge: self.config.calibre.automerge(),
+                    command: self.user.calibre.command(),
+                    library_path: self.user.calibre.library_path.clone(),
+                    automerge: self.user.calibre.automerge(),
                 },
                 "Importing to Calibre…",
             ),

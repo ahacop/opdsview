@@ -39,7 +39,8 @@ impl Feed {
 /// a specific Calibre library or a running content-server URL — pointing at the
 /// content server (e.g. `http://localhost:8080/#Library`) avoids the conflict
 /// that arises when the Calibre GUI holds the on-disk library open. All are
-/// edited directly in `feeds.json`; there is no in-app editor yet.
+/// edited directly in `config.toml` (see [`UserConfig`]); there is no in-app
+/// editor yet.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CalibreConfig {
     #[serde(default)]
@@ -80,11 +81,11 @@ impl CalibreConfig {
 /// User overrides for the on-disk locations opdsview uses.
 ///
 /// Every field is optional; an unset (or missing) field falls back to the
-/// platform default, so an absent `settings` block behaves exactly as before.
-/// A leading `~/` is expanded to the user's home directory. Edited directly in
-/// `feeds.json` under a `"settings"` key. See [`cache_dir`], [`library_dir`],
-/// and [`downloads_dir`], whose defaults these replace once [`install_settings`]
-/// has run.
+/// platform default, so an absent `[settings]` table behaves exactly as before.
+/// A leading `~/` is expanded to the user's home directory. Edited under the
+/// `[settings]` table of `config.toml` (see [`UserConfig`]). See [`cache_dir`],
+/// [`library_dir`], and [`downloads_dir`], whose defaults these replace once
+/// [`install_settings`] has run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     /// Where downloaded books and their metadata sidecars live (the built-in
@@ -101,17 +102,41 @@ pub struct Settings {
     pub download_dir: Option<String>,
 }
 
-/// The persisted application configuration: the list of saved feeds.
+/// Hand-edited user configuration, loaded from `config.toml` (TOML being the
+/// idiomatic Rust config format). Distinct from [`Config`], which holds the
+/// UI-managed feed list in `feeds.json`: this file is never written by the app,
+/// only read, so users own its formatting and comments.
+///
+/// A missing file yields all defaults. See [`UserConfig::load`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UserConfig {
+    /// User overrides for on-disk locations (the `[settings]` table).
+    #[serde(default)]
+    pub settings: Settings,
+    /// Settings for the Calibre import destination (the `[calibre]` table).
+    #[serde(default)]
+    pub calibre: CalibreConfig,
+}
+
+impl UserConfig {
+    /// Load `config.toml` from the config directory. A missing file is not an
+    /// error — it yields the defaults — so opdsview runs with zero configuration.
+    pub fn load() -> Result<Self> {
+        let path = config_toml_path()?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let data = fs::read_to_string(&path)
+            .with_context(|| format!("reading config {}", path.display()))?;
+        toml::from_str(&data).with_context(|| format!("parsing config {}", path.display()))
+    }
+}
+
+/// The persisted feed list, managed from the UI and saved to `feeds.json`.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub feeds: Vec<Feed>,
-    /// Settings for the Calibre import destination (see [`CalibreConfig`]).
-    #[serde(default)]
-    pub calibre: CalibreConfig,
-    /// User overrides for on-disk locations (see [`Settings`]).
-    #[serde(default)]
-    pub settings: Settings,
     #[serde(default)]
     next_id: u64,
 }
@@ -230,6 +255,11 @@ fn expand_tilde(path: &str) -> PathBuf {
 
 fn config_file() -> Result<PathBuf> {
     Ok(project_dirs()?.config_dir().join("feeds.json"))
+}
+
+/// Path to the hand-edited `config.toml` (see [`UserConfig`]).
+fn config_toml_path() -> Result<PathBuf> {
+    Ok(project_dirs()?.config_dir().join("config.toml"))
 }
 
 /// Directory used for cached feed and image data.
@@ -1013,6 +1043,30 @@ mod tests {
             std::env::temp_dir().join(format!("opdsview-test-{}-{tag}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn user_config_parses_toml_tables_and_defaults_missing_fields() {
+        let toml = r#"
+            [settings]
+            library_dir = "~/Books/opdsview"
+
+            [calibre]
+            command = "/opt/calibre/calibredb"
+            automerge = "overwrite"
+        "#;
+        let cfg: UserConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.settings.library_dir.as_deref(), Some("~/Books/opdsview"));
+        // Untouched fields fall back to None / their defaults.
+        assert_eq!(cfg.settings.cache_dir, None);
+        assert_eq!(cfg.calibre.command(), "/opt/calibre/calibredb");
+        assert_eq!(cfg.calibre.library_path, None);
+        assert_eq!(cfg.calibre.automerge().as_deref(), Some("overwrite"));
+
+        // An empty document is entirely valid and all-default.
+        let empty: UserConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.settings.library_dir, None);
+        assert_eq!(empty.calibre.command(), "calibredb");
     }
 
     #[test]
