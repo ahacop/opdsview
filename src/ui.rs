@@ -1,6 +1,6 @@
 //! Terminal rendering for all screens.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ratatui::Frame;
@@ -13,8 +13,8 @@ use ratatui::widgets::{
 use ratatui_image::StatefulImage;
 
 use crate::app::{
-    App, Backend, BrowserState, Confirm, DownloadSlot, FORM_LABELS, FormState, ImageSlot,
-    ReaderState, ReadingSlot, Screen,
+    App, Backend, BrowserState, Confirm, DOWNLOAD_DESTS, DownloadMenu, DownloadSlot, FORM_LABELS,
+    FormState, ImageSlot, ReaderState, ReadingSlot, Screen,
 };
 use crate::opds::Entry;
 use crate::reader::{Block as ContentBlock, block_height, render_chapter, search_book};
@@ -66,9 +66,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     .and_then(|d| d.library_id.as_ref())
                     .is_some()
                 {
-                    "↑↓ format   Enter/d download   g open copy   ⌫/h/Esc back"
+                    "↑↓ format   Enter/d download…   g open copy   ⌫/h/Esc back"
                 } else {
-                    "↑↓ format   Enter/d download   ⌫/h/Esc back"
+                    "↑↓ format   Enter/d download…   ⌫/h/Esc back"
                 }
             } else if library {
                 "↑↓ move   Enter open   / search   d delete   ⌫/h clear   q feeds"
@@ -82,6 +82,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 &mut app.images,
                 &app.downloads,
                 &app.reading,
+                &app.downloaded_ids,
             );
             render_help(frame, chunks[2], help);
         }
@@ -113,6 +114,20 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if let Some(confirm) = &app.confirm {
         render_confirm_delete(frame, area, app, confirm);
+    }
+
+    if let Some(menu) = &app.download_menu {
+        render_download_menu(frame, area, menu);
+        render_help(
+            frame,
+            chunks[2],
+            "↑↓ choose destination   Enter confirm   Esc cancel",
+        );
+    }
+
+    if let Some(msg) = &app.notice {
+        render_notice(frame, area, msg);
+        render_help(frame, chunks[2], "press any key to dismiss");
     }
 }
 
@@ -258,6 +273,7 @@ fn render_form(frame: &mut Frame, area: Rect, form: &FormState) {
 
 // --- Browser -------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn render_browser(
     frame: &mut Frame,
     area: Rect,
@@ -265,6 +281,7 @@ fn render_browser(
     images: &mut HashMap<String, ImageSlot>,
     downloads: &HashMap<String, DownloadSlot>,
     reading: &HashMap<String, ReadingSlot>,
+    downloaded: &HashSet<String>,
 ) {
     let Screen::Browser(b) = screen else { return };
 
@@ -279,11 +296,16 @@ fn render_browser(
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
-    render_entry_list(frame, panes[0], b);
-    render_detail(frame, panes[1], b, images);
+    render_entry_list(frame, panes[0], b, downloaded);
+    render_detail(frame, panes[1], b, images, reading);
 }
 
-fn render_entry_list(frame: &mut Frame, area: Rect, b: &BrowserState) {
+fn render_entry_list(
+    frame: &mut Frame,
+    area: Rect,
+    b: &BrowserState,
+    downloaded: &HashSet<String>,
+) {
     let title = format!(" {} ", crumb_path(b));
     let block = Block::default()
         .borders(Borders::ALL)
@@ -325,11 +347,16 @@ fn render_entry_list(frame: &mut Frame, area: Rect, b: &BrowserState) {
         return;
     }
 
+    // Only a remote catalog gets "downloaded" markers; in the library every
+    // book is by definition already downloaded.
+    let mark_downloaded = matches!(b.backend, Backend::Opds(_));
     let items: Vec<ListItem> = entries
         .iter()
         .map(|e| {
             let (marker, color) = if e.is_navigation() {
                 ("▸ ", ACCENT)
+            } else if mark_downloaded && is_downloaded(e, downloaded) {
+                ("✓ ", Color::Green)
             } else {
                 ("• ", Color::Reset)
             };
@@ -353,11 +380,22 @@ fn render_entry_list(frame: &mut Frame, area: Rect, b: &BrowserState) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// Whether a catalog entry's book is already in the local library, found by
+/// matching its computed id against the set of downloaded ids.
+fn is_downloaded(entry: &Entry, downloaded: &HashSet<String>) -> bool {
+    if downloaded.is_empty() {
+        return false;
+    }
+    let authors: Vec<String> = entry.author_names().map(str::to_string).collect();
+    downloaded.contains(&crate::storage::book_id(&authors, &entry.title))
+}
+
 fn render_detail(
     frame: &mut Frame,
     area: Rect,
     b: &BrowserState,
     images: &mut HashMap<String, ImageSlot>,
+    reading: &HashMap<String, ReadingSlot>,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -375,8 +413,9 @@ fn render_detail(
         .constraints([Constraint::Percentage(55), Constraint::Min(3)])
         .split(inner);
 
+    let reading_slot = entry.web_link().and_then(|l| reading.get(&l.href));
     render_cover(frame, split[0], entry, images);
-    render_entry_text(frame, split[1], entry);
+    render_entry_text(frame, split[1], entry, reading_slot);
 }
 
 fn render_cover(
@@ -418,7 +457,7 @@ fn render_cover(
     }
 }
 
-fn render_entry_text(frame: &mut Frame, area: Rect, entry: &Entry) {
+fn render_entry_text(frame: &mut Frame, area: Rect, entry: &Entry, reading: Option<&ReadingSlot>) {
     let mut lines = vec![Line::from(Span::styled(
         entry.title.clone(),
         Style::default().add_modifier(Modifier::BOLD).fg(ACCENT),
@@ -432,6 +471,7 @@ fn render_entry_text(frame: &mut Frame, area: Rect, entry: &Entry) {
     }
 
     push_meta_lines(&mut lines, entry);
+    push_reading_lines(&mut lines, reading);
     lines.push(Line::from(""));
 
     if let Some(summary) = &entry.summary {
@@ -1056,6 +1096,74 @@ fn render_confirm_delete(frame: &mut Frame, area: Rect, app: &App, confirm: &Con
     ])
     .block(block);
     frame.render_widget(text, popup);
+}
+
+/// A centered menu for choosing where the highlighted format is saved.
+fn render_download_menu(frame: &mut Frame, area: Rect, menu: &DownloadMenu) {
+    let rows = DOWNLOAD_DESTS.len() as u16 + 2;
+    let popup = centered_rect(50, rows, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" Download to ");
+    let items: Vec<ListItem> = DOWNLOAD_DESTS
+        .iter()
+        .map(|d| ListItem::new(Line::from(d.to_string())))
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .bg(ACCENT)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▸ ");
+    let mut state = ListState::default();
+    state.select(Some(menu.selected));
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
+/// A centered, dismissible message popup for errors too long for the status
+/// line (e.g. calibredb's failure output). Sized to the message, capped to the
+/// screen, with the text wrapped.
+fn render_notice(frame: &mut Frame, area: Rect, msg: &str) {
+    // Estimate wrapped height: the body's rows plus borders, margin, and footer.
+    let inner_w = (area.width * 70 / 100).saturating_sub(4).max(1) as usize;
+    let body_rows: usize = msg
+        .split('\n')
+        .map(|para| para.chars().count().div_ceil(inner_w).max(1))
+        .sum();
+    let height = (body_rows as u16 + 4).min(area.height.max(3));
+    let popup = centered_rect(70, height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Error ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .margin(1)
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(msg.to_string()).wrap(Wrap { trim: true }),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "press any key to dismiss",
+            Style::default().fg(Color::DarkGray),
+        )),
+        rows[1],
+    );
 }
 
 // --- Helpers -------------------------------------------------------------

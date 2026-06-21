@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
+use directories::{ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
 
 use crate::opds::{Author, Category, Entry, Link, REL_ACQUISITION, REL_IMAGE};
@@ -31,20 +31,69 @@ impl Feed {
     }
 }
 
+/// Settings for the optional "Import to Calibre" download destination.
+///
+/// `command` is the calibredb executable (looked up on `PATH` when just a
+/// name); `library_path` is passed as `--library-path` so the import can target
+/// a specific Calibre library or a running content-server URL — pointing at the
+/// content server (e.g. `http://localhost:8080/#Library`) avoids the conflict
+/// that arises when the Calibre GUI holds the on-disk library open. All are
+/// edited directly in `feeds.json`; there is no in-app editor yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CalibreConfig {
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub library_path: Option<String>,
+    /// How calibredb merges an import whose title+author already exist (passed
+    /// as `--automerge`). See [`CalibreConfig::automerge`].
+    #[serde(default)]
+    pub automerge: Option<String>,
+}
+
+impl CalibreConfig {
+    /// The configured calibredb command, defaulting to `calibredb` on `PATH`.
+    pub fn command(&self) -> String {
+        self.command
+            .clone()
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| "calibredb".to_string())
+    }
+
+    /// The `--automerge` mode for importing a book that already exists in the
+    /// library (by title + author). Defaults to `ignore` — merge new formats
+    /// into the existing record, discarding formats already present — so adding
+    /// a different format of an existing book works instead of being silently
+    /// skipped as a duplicate. Other values: `overwrite`, `new_record`. An
+    /// explicitly empty string disables automerge (calibredb then skips
+    /// duplicate books, which can look like a silent no-op).
+    pub fn automerge(&self) -> Option<String> {
+        match &self.automerge {
+            None => Some("ignore".to_string()),
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => Some(s.trim().to_string()),
+        }
+    }
+}
+
 /// The persisted application configuration: the list of saved feeds.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub feeds: Vec<Feed>,
+    /// Settings for the Calibre import destination (see [`CalibreConfig`]).
+    #[serde(default)]
+    pub calibre: CalibreConfig,
     #[serde(default)]
     next_id: u64,
 }
 
 /// OPDS catalogs seeded into a fresh install on first run, as `(name, url)`
 /// pairs. These are openly accessible feeds requiring no authentication.
-const DEFAULT_FEEDS: &[(&str, &str)] = &[
-    ("Project Gutenberg", "https://www.gutenberg.org/ebooks.opds/"),
-];
+const DEFAULT_FEEDS: &[(&str, &str)] = &[(
+    "Project Gutenberg",
+    "https://www.gutenberg.org/ebooks.opds/",
+)];
 
 impl Config {
     /// A config pre-populated with the [`DEFAULT_FEEDS`], used on first run.
@@ -126,6 +175,14 @@ pub fn cache_dir() -> Result<PathBuf> {
 /// Directory where downloaded books and their metadata sidecars are saved.
 pub fn library_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.data_dir().join("library"))
+}
+
+/// The user's Downloads directory, for the "~/Downloads" save destination.
+pub fn downloads_dir() -> Result<PathBuf> {
+    let dirs = UserDirs::new().context("could not determine user directories")?;
+    dirs.download_dir()
+        .map(Path::to_path_buf)
+        .context("no Downloads directory is configured for this user")
 }
 
 // --- Downloaded-book library ---------------------------------------------
@@ -481,6 +538,135 @@ fn downloaded_book_id_in(dir: &Path, authors: &[String], title: &str) -> Option<
     dir.join(format!("{id}.json")).exists().then_some(id)
 }
 
+/// The ids (sidecar stems) of every book currently in the local library.
+///
+/// Cheaper than [`load_library`] — it reads only the directory listing, not the
+/// sidecar contents — so the catalog list can refresh its "downloaded" markers
+/// without parsing every book's metadata. A missing library directory yields an
+/// empty list.
+pub fn library_ids() -> Result<Vec<String>> {
+    library_ids_in(&library_dir()?)
+}
+
+fn library_ids_in(dir: &Path) -> Result<Vec<String>> {
+    let read_dir = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut ids = Vec::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            ids.push(stem.to_string());
+        }
+    }
+    Ok(ids)
+}
+
+/// Save a downloaded ebook as a plain file in `dir` (no sidecar, no cover), for
+/// the "~/Downloads" destination. The file is named after the book's title so
+/// it lands with a human-readable name rather than a library slug.
+pub fn save_loose(
+    dir: &Path,
+    meta: &LibraryEntry,
+    mime: &str,
+    ebook_url: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    fs::create_dir_all(dir).with_context(|| format!("creating directory {}", dir.display()))?;
+    let path = dir.join(friendly_filename(meta, mime, ebook_url));
+    fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// Import a downloaded ebook into Calibre by writing it to a temporary file and
+/// running `calibredb add`. Returns the temp file's path.
+///
+/// `automerge` (when set) is passed as `--automerge=<mode>` so importing a
+/// different format of a book already in the library merges into the existing
+/// record rather than being skipped as a duplicate. Failures — and the case
+/// where calibredb adds nothing because the book already exists — are surfaced
+/// to the caller instead of looking like a silent success.
+pub fn import_to_calibre(
+    command: &str,
+    library_path: Option<&str>,
+    automerge: Option<&str>,
+    meta: &LibraryEntry,
+    mime: &str,
+    ebook_url: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    let path = std::env::temp_dir().join(friendly_filename(meta, mime, ebook_url));
+    fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+
+    let mut cmd = std::process::Command::new(command);
+    cmd.arg("add");
+    if let Some(lib) = library_path.filter(|l| !l.trim().is_empty()) {
+        cmd.arg("--library-path").arg(lib);
+    }
+    if let Some(mode) = automerge.filter(|m| !m.trim().is_empty()) {
+        cmd.arg(format!("--automerge={mode}"));
+    }
+    cmd.arg(&path);
+    // Capture stdout/stderr rather than letting calibredb write over the TUI;
+    // its output is the useful part of any failure, so fold it into the error.
+    let output = cmd
+        .output()
+        .with_context(|| format!("running {command} add"))?;
+    if !output.status.success() {
+        let detail = squish(&String::from_utf8_lossy(&output.stderr));
+        if detail.is_empty() {
+            anyhow::bail!("{command} add failed ({})", output.status);
+        }
+        anyhow::bail!("{command} add failed ({}): {detail}", output.status);
+    }
+    // calibredb exits 0 even when it adds nothing because the book already
+    // exists (and automerge is off); treat that as an error so it isn't a
+    // silent no-op.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("already exist") {
+        anyhow::bail!(
+            "Not added — this book is already in Calibre. {}",
+            squish(&stdout)
+        );
+    }
+    Ok(path)
+}
+
+/// Collapse runs of whitespace (including newlines) into single spaces, so
+/// multi-line subprocess output fits on one line of an error message.
+fn squish(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A human-readable filename for a loose copy: the book's title (with filesystem-
+/// unsafe characters replaced) plus the format's canonical extension.
+fn friendly_filename(meta: &LibraryEntry, mime: &str, ebook_url: &str) -> String {
+    let ext = ext_for_mime(mime)
+        .map(str::to_string)
+        .unwrap_or_else(|| ext_from_url(ebook_url));
+    let base: String = meta
+        .title
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let base = base.trim();
+    if base.is_empty() {
+        format!("book.{ext}")
+    } else {
+        format!("{base}.{ext}")
+    }
+}
+
 /// Open a downloaded file in the operating system's default application.
 pub fn open_in_reader(path: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
@@ -507,7 +693,10 @@ pub fn open_in_reader(path: &Path) -> Result<()> {
 /// A stable, readable id for a book, used as the `<id>` filename stem so every
 /// format of one book shares a sidecar and cover. A short content hash is
 /// appended so distinct books that slug identically don't collide.
-fn book_id(authors: &[String], title: &str) -> String {
+///
+/// Public so the catalog list can compute a candidate entry's id and check it
+/// against [`library_ids`] to mark already-downloaded books.
+pub fn book_id(authors: &[String], title: &str) -> String {
     use sha2::{Digest, Sha256};
 
     let mut base = String::new();
@@ -664,7 +853,10 @@ mod tests {
             username: None,
             password: None,
         });
-        assert_eq!(config.feeds.last().unwrap().id, DEFAULT_FEEDS.len() as u64 + 1);
+        assert_eq!(
+            config.feeds.last().unwrap().id,
+            DEFAULT_FEEDS.len() as u64 + 1
+        );
     }
 
     #[test]
@@ -825,5 +1017,49 @@ mod tests {
     fn missing_library_dir_loads_empty() {
         let dir = temp_dir("missing");
         assert!(load_library_from(&dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn library_ids_lists_saved_book_stems() {
+        let dir = temp_dir("ids");
+        // No directory yet → empty.
+        assert!(library_ids_in(&dir).unwrap().is_empty());
+        save_book_in(
+            &dir,
+            sample_meta(),
+            "application/epub+zip",
+            None,
+            "https://se.org/b.epub",
+            b"E",
+            None,
+        )
+        .unwrap();
+        let authors = vec!["Willa Cather".to_string()];
+        assert_eq!(
+            library_ids_in(&dir).unwrap(),
+            vec![book_id(&authors, "The Professor's House")]
+        );
+    }
+
+    #[test]
+    fn friendly_filename_uses_title_and_format_extension() {
+        let meta = sample_meta();
+        // Title with an apostrophe becomes a filesystem-safe name with the
+        // EPUB extension from the mime type.
+        assert_eq!(
+            friendly_filename(&meta, "application/epub+zip", "https://se.org/b.epub"),
+            "The Professor_s House.epub"
+        );
+        // Unknown mime falls back to the URL's extension.
+        assert_eq!(
+            friendly_filename(&meta, "application/unknown", "https://se.org/b.azw3"),
+            "The Professor_s House.azw3"
+        );
+        // An empty title falls back to a generic stem.
+        let blank = LibraryEntry::default();
+        assert_eq!(
+            friendly_filename(&blank, "application/epub+zip", "https://se.org/b.epub"),
+            "book.epub"
+        );
     }
 }

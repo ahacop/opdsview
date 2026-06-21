@@ -30,6 +30,7 @@ fn main() -> Result<()> {
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App, worker: &Worker) -> Result<()> {
+    let mut had_overlay = false;
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
 
@@ -50,6 +51,15 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App, worker: &Worker) 
             app.handle_key(key);
             dispatch(app, worker);
         }
+
+        // A popup that was painted over a graphics-protocol image leaves its
+        // cells behind when it closes; a full clear forces the image to be
+        // re-emitted on the next draw.
+        let overlay = app.has_overlay();
+        if had_overlay && !overlay {
+            terminal.clear()?;
+        }
+        had_overlay = overlay;
 
         if app.should_quit {
             break;

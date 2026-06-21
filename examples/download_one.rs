@@ -8,7 +8,7 @@ use std::time::Duration;
 use opdsview::cache::Cache;
 use opdsview::opds::Feed;
 use opdsview::storage::{LibraryEntry, cache_dir};
-use opdsview::worker::{Request, Response, Worker};
+use opdsview::worker::{DownloadDest, Request, Response, Worker};
 
 fn main() -> anyhow::Result<()> {
     let url = std::env::args()
@@ -42,6 +42,7 @@ fn main() -> anyhow::Result<()> {
         length: link.length,
         cover_url: entry.image_link().map(|l| l.href.clone()),
         auth,
+        dest: DownloadDest::Library,
     });
 
     match worker.rx.recv_timeout(Duration::from_secs(60))? {

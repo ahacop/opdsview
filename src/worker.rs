@@ -23,14 +23,50 @@ const FEED_TTL: Duration = Duration::from_secs(15 * 60);
 
 type Auth = Option<(String, String)>;
 
+/// Where a download should be written.
+pub enum DownloadDest {
+    /// The opdsview library (with cover + metadata sidecar); the readable copy.
+    Library,
+    /// A plain file in the user's Downloads directory.
+    Downloads,
+    /// Imported into Calibre via `command add`, optionally `--library-path` and
+    /// `--automerge`.
+    Calibre {
+        command: String,
+        library_path: Option<String>,
+        automerge: Option<String>,
+    },
+}
+
+/// A destination tag echoed back with a download response, so the UI can phrase
+/// completion (and refresh "downloaded" markers only for library saves) without
+/// re-deriving where the file went.
+#[derive(Clone, Copy)]
+pub enum DownloadKind {
+    Library,
+    Downloads,
+    Calibre,
+}
+
+impl DownloadDest {
+    fn kind(&self) -> DownloadKind {
+        match self {
+            DownloadDest::Library => DownloadKind::Library,
+            DownloadDest::Downloads => DownloadKind::Downloads,
+            DownloadDest::Calibre { .. } => DownloadKind::Calibre,
+        }
+    }
+}
+
 /// A request sent from the UI thread to the worker.
 pub enum Request {
     /// Fetch and parse an OPDS feed.
     Feed { url: String, auth: Auth },
     /// Fetch and decode a cover image, keyed by its URL.
     Image { url: String, auth: Auth },
-    /// Download a book to the library, persisting a metadata sidecar. `url` is
-    /// the chosen acquisition link (and the key the UI tracks progress under).
+    /// Download a book to the chosen destination. `url` is the acquisition link
+    /// (and the key the UI tracks progress under). Only [`DownloadDest::Library`]
+    /// writes a metadata sidecar and cover.
     Download {
         meta: Box<LibraryEntry>,
         url: String,
@@ -38,9 +74,13 @@ pub enum Request {
         length: Option<u64>,
         cover_url: Option<String>,
         auth: Auth,
+        dest: DownloadDest,
     },
     /// Load all downloaded books from the local library.
     Library,
+    /// List the ids of books in the library (for the catalog's "downloaded"
+    /// markers) without parsing every sidecar.
+    LibraryIds,
     /// Run an OpenSearch query: resolve the description at `desc_url`, then
     /// fetch the resulting acquisition feed.
     Search {
@@ -80,10 +120,15 @@ pub enum Response {
     },
     Download {
         url: String,
+        kind: DownloadKind,
         result: Result<PathBuf>,
     },
     Library {
         result: Result<Vec<LibraryBook>>,
+    },
+    /// The ids of books currently in the library.
+    LibraryIds {
+        result: Result<Vec<String>>,
     },
     /// A search result: the resolved feed URL and its parsed feed.
     Search {
@@ -135,7 +180,9 @@ impl Worker {
                         length,
                         cover_url,
                         auth,
+                        dest,
                     } => {
+                        let kind = dest.kind();
                         let result = download_book(
                             &http,
                             &cache,
@@ -145,12 +192,17 @@ impl Worker {
                             length,
                             cover_url.as_deref(),
                             &auth,
+                            dest,
                         );
-                        let _ = resp_tx.send(Response::Download { url, result });
+                        let _ = resp_tx.send(Response::Download { url, kind, result });
                     }
                     Request::Library => {
                         let result = storage::load_library();
                         let _ = resp_tx.send(Response::Library { result });
+                    }
+                    Request::LibraryIds => {
+                        let result = storage::library_ids();
+                        let _ = resp_tx.send(Response::LibraryIds { result });
                     }
                     Request::Search {
                         desc_url,
@@ -378,11 +430,12 @@ fn fetch_book_image(path: &Path, chapter: usize, src: &str) -> Result<DynamicIma
     image::load_from_memory(&bytes).with_context(|| format!("decoding image {src}"))
 }
 
-/// Download a book into the local library and return the saved ebook path.
+/// Download a book to the chosen destination and return the saved file's path.
 ///
-/// Fetches the ebook and, the first time a book is saved, its cover (reusing
-/// any cached cover bytes from browsing). [`storage::save_book`] writes the
-/// files and the metadata sidecar.
+/// [`DownloadDest::Library`] saves into the opdsview library with its cover
+/// (reusing any cached cover bytes from browsing) and a metadata sidecar;
+/// [`DownloadDest::Downloads`] writes a plain copy to the user's Downloads
+/// directory; [`DownloadDest::Calibre`] imports it via `calibredb add`.
 #[allow(clippy::too_many_arguments)]
 fn download_book(
     http: &reqwest::blocking::Client,
@@ -393,8 +446,29 @@ fn download_book(
     length: Option<u64>,
     cover_url: Option<&str>,
     auth: &Auth,
+    dest: DownloadDest,
 ) -> Result<PathBuf> {
     let bytes = get_bytes(http, url, auth)?;
-    let cover_bytes = cover_url.and_then(|u| image_bytes(http, cache, u, auth).ok());
-    storage::save_book(meta, mime, length, url, &bytes, cover_bytes.as_deref())
+    match dest {
+        DownloadDest::Library => {
+            let cover_bytes = cover_url.and_then(|u| image_bytes(http, cache, u, auth).ok());
+            storage::save_book(meta, mime, length, url, &bytes, cover_bytes.as_deref())
+        }
+        DownloadDest::Downloads => {
+            storage::save_loose(&storage::downloads_dir()?, &meta, mime, url, &bytes)
+        }
+        DownloadDest::Calibre {
+            command,
+            library_path,
+            automerge,
+        } => storage::import_to_calibre(
+            &command,
+            library_path.as_deref(),
+            automerge.as_deref(),
+            &meta,
+            mime,
+            url,
+            &bytes,
+        ),
+    }
 }

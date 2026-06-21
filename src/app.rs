@@ -1,6 +1,6 @@
 //! Application state, input handling, and response handling.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -12,7 +12,7 @@ use crate::opds::{Entry, Feed};
 use crate::reader::{Block, BookContent};
 use crate::reading::ReadingStats;
 use crate::storage::{Config, Feed as FeedConfig, LibraryBook, LibraryEntry, ReadingProgress};
-use crate::worker::{Request, Response};
+use crate::worker::{DownloadDest, DownloadKind, Request, Response};
 
 type Auth = Option<(String, String)>;
 
@@ -219,6 +219,32 @@ pub enum Confirm {
     DeleteBook(usize),
 }
 
+/// The destinations offered by the download menu, in display order.
+pub const DOWNLOAD_DESTS: [&str; 3] = [
+    "opdsview library (readable here)",
+    "~/Downloads",
+    "Import to Calibre",
+];
+
+/// Everything the worker needs to download one acquisition link, captured when
+/// the download menu opens so confirming a destination needs no further lookup.
+struct PendingDownload {
+    meta: Box<LibraryEntry>,
+    url: String,
+    mime: String,
+    length: Option<u64>,
+    cover_url: Option<String>,
+    auth: Auth,
+}
+
+/// The open "choose a download destination" menu.
+pub struct DownloadMenu {
+    /// Highlighted row, an index into [`DOWNLOAD_DESTS`].
+    pub selected: usize,
+    /// The download to dispatch once a destination is chosen.
+    pending: PendingDownload,
+}
+
 /// In-book string search state for the reader.
 #[derive(Default)]
 pub struct SearchState {
@@ -313,6 +339,14 @@ pub struct App {
     pub feed_list: ListState,
     /// A pending confirmation popup (delete feed / delete book), if open.
     pub confirm: Option<Confirm>,
+    /// The open download-destination menu, if any.
+    pub download_menu: Option<DownloadMenu>,
+    /// A dismissible message popup (e.g. a download error too long for the
+    /// status line). Any key closes it.
+    pub notice: Option<String>,
+    /// Ids of books in the local library, for the catalog's "downloaded"
+    /// markers. Refreshed when a catalog opens and after each download.
+    pub downloaded_ids: HashSet<String>,
     pub status: String,
     pub should_quit: bool,
     /// Outgoing network requests, drained by the main loop after each update.
@@ -335,6 +369,9 @@ impl App {
             screen: Screen::FeedList,
             feed_list,
             confirm: None,
+            download_menu: None,
+            notice: None,
+            downloaded_ids: HashSet::new(),
             status: String::new(),
             should_quit: false,
             outbox: Vec::new(),
@@ -345,12 +382,36 @@ impl App {
         }
     }
 
+    /// Whether a popup is currently painted over the main content. Used to
+    /// force a full redraw when one closes, so any graphics-protocol image it
+    /// covered is re-emitted instead of leaving the popup's cells behind.
+    pub fn has_overlay(&self) -> bool {
+        if self.notice.is_some() || self.confirm.is_some() || self.download_menu.is_some() {
+            return true;
+        }
+        match &self.screen {
+            Screen::Browser(b) => b.search_query.is_some(),
+            Screen::Reader(r) => r.search.input.is_some() || r.toc_open,
+            _ => false,
+        }
+    }
+
     // --- Input ------------------------------------------------------------
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // A message popup swallows the next key, which dismisses it.
+        if self.notice.is_some() {
+            self.notice = None;
+            return;
+        }
         // A popup confirmation intercepts all keys.
         if self.confirm.is_some() {
             self.handle_confirm_key(key);
+            return;
+        }
+        // The download-destination menu likewise intercepts all keys.
+        if self.download_menu.is_some() {
+            self.handle_download_menu_key(key);
             return;
         }
         match &mut self.screen {
@@ -440,22 +501,22 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.screen = Screen::FeedList,
             KeyCode::Char('j') | KeyCode::Down => {
                 move_sel(&mut b.list, len, 1);
-                self.request_selected_image();
+                self.request_selected();
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 move_sel(&mut b.list, len, -1);
-                self.request_selected_image();
+                self.request_selected();
             }
             KeyCode::Char('g') => {
                 if len > 0 {
                     b.list.select(Some(0));
-                    self.request_selected_image();
+                    self.request_selected();
                 }
             }
             KeyCode::Char('G') => {
                 if len > 0 {
                     b.list.select(Some(len - 1));
-                    self.request_selected_image();
+                    self.request_selected();
                 }
             }
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.follow_selected(),
@@ -518,7 +579,7 @@ impl App {
                 let len = feed.entries.len();
                 b.feed = Some(feed);
                 b.list.select(if len == 0 { None } else { Some(0) });
-                self.request_selected_image();
+                self.request_selected();
             }
             Backend::Opds(o) => {
                 if query.is_empty() {
@@ -641,6 +702,8 @@ impl App {
         };
         self.screen = Screen::Browser(Box::new(browser));
         self.outbox.push(Request::Feed { url, auth });
+        // Refresh the set of downloaded books so the list can mark them.
+        self.outbox.push(Request::LibraryIds);
     }
 
     /// Open the local downloaded-book library. When `open_target` is `Some`, the
@@ -847,8 +910,8 @@ impl App {
         }
     }
 
-    /// Queue a download of the format highlighted in the detail view, carrying
-    /// the metadata the worker needs to persist a library sidecar.
+    /// Open the destination menu for the format highlighted in the detail view,
+    /// gathering the metadata the worker will need once a destination is picked.
     fn download_selected_format(&mut self) {
         let Screen::Browser(b) = &self.screen else {
             return;
@@ -883,15 +946,72 @@ impl App {
             meta.reading = Some(stats.clone());
         }
         let auth = b.auth();
-        self.downloads.insert(url.clone(), DownloadSlot::Pending);
-        self.status = "Downloading…".into();
-        self.outbox.push(Request::Download {
-            meta: Box::new(meta),
+        self.download_menu = Some(DownloadMenu {
+            selected: 0,
+            pending: PendingDownload {
+                meta: Box::new(meta),
+                url,
+                mime,
+                length,
+                cover_url,
+                auth,
+            },
+        });
+    }
+
+    /// Key handling while the download-destination menu is open.
+    fn handle_download_menu_key(&mut self, key: KeyEvent) {
+        let Some(menu) = self.download_menu.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.download_menu = None,
+            KeyCode::Char('j') | KeyCode::Down => {
+                menu.selected = (menu.selected + 1).min(DOWNLOAD_DESTS.len() - 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                menu.selected = menu.selected.saturating_sub(1);
+            }
+            KeyCode::Enter | KeyCode::Char('l') => self.confirm_download(),
+            _ => {}
+        }
+    }
+
+    /// Dispatch the pending download to the destination highlighted in the menu.
+    fn confirm_download(&mut self) {
+        let Some(menu) = self.download_menu.take() else {
+            return;
+        };
+        let (dest, status): (DownloadDest, &str) = match menu.selected {
+            1 => (DownloadDest::Downloads, "Saving to ~/Downloads…"),
+            2 => (
+                DownloadDest::Calibre {
+                    command: self.config.calibre.command(),
+                    library_path: self.config.calibre.library_path.clone(),
+                    automerge: self.config.calibre.automerge(),
+                },
+                "Importing to Calibre…",
+            ),
+            _ => (DownloadDest::Library, "Downloading…"),
+        };
+        let PendingDownload {
+            meta,
             url,
             mime,
             length,
             cover_url,
             auth,
+        } = menu.pending;
+        self.downloads.insert(url.clone(), DownloadSlot::Pending);
+        self.status = status.into();
+        self.outbox.push(Request::Download {
+            meta,
+            url,
+            mime,
+            length,
+            cover_url,
+            auth,
+            dest,
         });
     }
 
@@ -1268,6 +1388,13 @@ impl App {
         });
     }
 
+    /// Queue the lazy fetches for a newly highlighted entry: its cover image and
+    /// its scraped reading metrics.
+    fn request_selected(&mut self) {
+        self.request_selected_image();
+        self.request_selected_reading();
+    }
+
     /// Queue an image fetch for the currently selected entry, if needed.
     fn request_selected_image(&mut self) {
         let Screen::Browser(b) = &self.screen else {
@@ -1288,6 +1415,29 @@ impl App {
         self.outbox.push(Request::Image { url, auth });
     }
 
+    /// Queue a reading-metrics scrape for the currently selected entry's web
+    /// page, if it has one and we haven't already fetched (or seeded) it. The
+    /// metrics are Standard Ebooks-specific; other catalogs resolve to
+    /// [`ReadingSlot::Unavailable`] and simply show nothing.
+    fn request_selected_reading(&mut self) {
+        let Screen::Browser(b) = &self.screen else {
+            return;
+        };
+        let Some(entry) = b.selected_entry() else {
+            return;
+        };
+        let Some(web) = entry.web_link() else {
+            return;
+        };
+        let url = web.href.clone();
+        if self.reading.contains_key(&url) {
+            return;
+        }
+        let auth = b.auth();
+        self.reading.insert(url.clone(), ReadingSlot::Loading);
+        self.outbox.push(Request::Reading { url, auth });
+    }
+
     // --- Worker responses -------------------------------------------------
 
     pub fn handle_response(&mut self, resp: Response) {
@@ -1300,22 +1450,32 @@ impl App {
                 };
                 self.images.insert(url, slot);
             }
-            Response::Download { url, result } => {
+            Response::Download { url, kind, result } => {
                 let slot = match result {
                     Ok(path) => {
-                        self.status = format!("Saved to {}", path.display());
+                        self.status = match kind {
+                            DownloadKind::Calibre => "Imported to Calibre".into(),
+                            _ => format!("Saved to {}", path.display()),
+                        };
                         DownloadSlot::Done(path)
                     }
                     Err(e) => {
                         let msg = format!("{e:#}");
-                        self.status = format!("Download failed: {msg}");
+                        // The full error can be long (e.g. calibredb's output),
+                        // so show it in a dismissible popup, not the status line.
+                        self.notice = Some(format!("Download failed\n\n{msg}"));
+                        self.status = "Download failed".into();
                         DownloadSlot::Failed(msg)
                     }
                 };
-                // A book just saved while its catalog detail is open can now be
-                // jumped to in the library.
-                if matches!(slot, DownloadSlot::Done(_)) {
+                // A book just saved to the library (while its catalog detail is
+                // open) can now be jumped to, and joins the "downloaded" markers.
+                if matches!(
+                    (&slot, kind),
+                    (DownloadSlot::Done(_), DownloadKind::Library)
+                ) {
                     self.mark_detail_downloaded(&url);
+                    self.outbox.push(Request::LibraryIds);
                 }
                 self.downloads.insert(url, slot);
             }
@@ -1328,6 +1488,11 @@ impl App {
                 self.reading.insert(url, slot);
             }
             Response::Library { result } => self.on_library(result),
+            Response::LibraryIds { result } => {
+                if let Ok(ids) = result {
+                    self.downloaded_ids = ids.into_iter().collect();
+                }
+            }
             Response::Book { result } => self.on_book(result),
         }
     }
@@ -1393,7 +1558,7 @@ impl App {
                 });
                 b.feed = Some(feed);
                 b.error = None;
-                self.request_selected_image();
+                self.request_selected();
             }
             Err(e) => {
                 b.feed = None;
@@ -1430,7 +1595,7 @@ impl App {
                 b.list.select(if len == 0 { None } else { Some(sel) });
                 b.feed = Some(feed);
                 b.error = None;
-                self.request_selected_image();
+                self.request_selected();
             }
             Err(e) => {
                 b.feed = None;
@@ -1469,7 +1634,7 @@ impl App {
                 b.list.select(if len == 0 { None } else { Some(sel) });
                 b.feed = Some(feed);
                 b.error = None;
-                self.request_selected_image();
+                self.request_selected();
             }
             Err(e) => {
                 b.feed = None;
