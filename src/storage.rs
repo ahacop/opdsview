@@ -77,6 +77,30 @@ impl CalibreConfig {
     }
 }
 
+/// User overrides for the on-disk locations opdsview uses.
+///
+/// Every field is optional; an unset (or missing) field falls back to the
+/// platform default, so an absent `settings` block behaves exactly as before.
+/// A leading `~/` is expanded to the user's home directory. Edited directly in
+/// `feeds.json` under a `"settings"` key. See [`cache_dir`], [`library_dir`],
+/// and [`downloads_dir`], whose defaults these replace once [`install_settings`]
+/// has run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Settings {
+    /// Where downloaded books and their metadata sidecars live (the built-in
+    /// library). Default: the app data directory's `library/` subfolder.
+    #[serde(default)]
+    pub library_dir: Option<String>,
+    /// Where cached feed XML and cover images live. Default: the app cache
+    /// directory.
+    #[serde(default)]
+    pub cache_dir: Option<String>,
+    /// Where the "~/Downloads" download destination writes files. Default: the
+    /// user's Downloads directory.
+    #[serde(default)]
+    pub download_dir: Option<String>,
+}
+
 /// The persisted application configuration: the list of saved feeds.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -85,6 +109,9 @@ pub struct Config {
     /// Settings for the Calibre import destination (see [`CalibreConfig`]).
     #[serde(default)]
     pub calibre: CalibreConfig,
+    /// User overrides for on-disk locations (see [`Settings`]).
+    #[serde(default)]
+    pub settings: Settings,
     #[serde(default)]
     next_id: u64,
 }
@@ -164,22 +191,68 @@ fn project_dirs() -> Result<ProjectDirs> {
         .context("could not determine application directories")
 }
 
+/// Process-wide path overrides, installed once at startup from the loaded
+/// [`Config`]. The directory accessors below consult this; before it is set (or
+/// when a field is unset), they fall back to the platform defaults.
+static SETTINGS: std::sync::OnceLock<Settings> = std::sync::OnceLock::new();
+
+/// Install the user's path overrides for the rest of the process. Call once at
+/// startup, after loading the [`Config`] and before any directory accessor is
+/// used (the worker reads them on its own thread, so this must precede the
+/// worker spawn). Later calls are ignored — the first install wins.
+pub fn install_settings(settings: Settings) {
+    let _ = SETTINGS.set(settings);
+}
+
+/// The override path for one [`Settings`] field, with a leading `~/` expanded,
+/// or `None` when unset or empty.
+fn override_dir(pick: impl Fn(&Settings) -> Option<&String>) -> Option<PathBuf> {
+    let raw = SETTINGS.get().and_then(&pick)?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| expand_tilde(trimmed))
+}
+
+/// Expand a leading `~` (alone or as `~/…`) to the user's home directory. Any
+/// other path is returned verbatim.
+fn expand_tilde(path: &str) -> PathBuf {
+    let home = || UserDirs::new().map(|d| d.home_dir().to_path_buf());
+    if path == "~" {
+        if let Some(home) = home() {
+            return home;
+        }
+    } else if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = home()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(path)
+}
+
 fn config_file() -> Result<PathBuf> {
     Ok(project_dirs()?.config_dir().join("feeds.json"))
 }
 
 /// Directory used for cached feed and image data.
 pub fn cache_dir() -> Result<PathBuf> {
+    if let Some(dir) = override_dir(|s| s.cache_dir.as_ref()) {
+        return Ok(dir);
+    }
     Ok(project_dirs()?.cache_dir().to_path_buf())
 }
 
 /// Directory where downloaded books and their metadata sidecars are saved.
 pub fn library_dir() -> Result<PathBuf> {
+    if let Some(dir) = override_dir(|s| s.library_dir.as_ref()) {
+        return Ok(dir);
+    }
     Ok(project_dirs()?.data_dir().join("library"))
 }
 
 /// The user's Downloads directory, for the "~/Downloads" save destination.
 pub fn downloads_dir() -> Result<PathBuf> {
+    if let Some(dir) = override_dir(|s| s.download_dir.as_ref()) {
+        return Ok(dir);
+    }
     let dirs = UserDirs::new().context("could not determine user directories")?;
     dirs.download_dir()
         .map(Path::to_path_buf)
@@ -940,6 +1013,16 @@ mod tests {
             std::env::temp_dir().join(format!("opdsview-test-{}-{tag}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn expand_tilde_expands_home_and_leaves_other_paths() {
+        let home = UserDirs::new().unwrap().home_dir().to_path_buf();
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/Books"), home.join("Books"));
+        // An absolute path and a bare ~user form are passed through untouched.
+        assert_eq!(expand_tilde("/srv/library"), PathBuf::from("/srv/library"));
+        assert_eq!(expand_tilde("~bob/x"), PathBuf::from("~bob/x"));
     }
 
     fn sample_meta() -> LibraryEntry {

@@ -108,6 +108,41 @@ Paths follow the platform conventions (via the `directories` crate):
   `Downloads` directory (e.g. `~/Downloads/opdsview/`), falling back to the
   app data directory when no `Downloads` folder exists.
 
+## Configuration
+
+Feeds and settings live in `feeds.json` in the config directory
+(e.g. `~/.config/opdsview/feeds.json` on Linux). Feeds are managed from the UI,
+but the rest is edited by hand. Every key is optional and falls back to the
+default shown above, so you only set what you want to change. A leading `~/` in
+a path is expanded to your home directory.
+
+```json
+{
+  "settings": {
+    "library_dir": "~/Books/opdsview",
+    "cache_dir": "~/.cache/opdsview",
+    "download_dir": "~/Downloads"
+  },
+  "calibre": {
+    "command": "calibredb",
+    "library_path": "~/Calibre Library",
+    "automerge": "ignore"
+  }
+}
+```
+
+- **`settings.library_dir`** — where the built-in library keeps downloaded books.
+- **`settings.cache_dir`** — where feed XML and cover images are cached.
+- **`settings.download_dir`** — where the "~/Downloads" destination saves files.
+- **`calibre.command`** — the `calibredb` executable (a bare name is looked up on
+  `PATH`); point it at a full path to use a specific Calibre install.
+- **`calibre.library_path`** — the Calibre library to import into, passed as
+  `--library-path`. This can be a directory **or** a running content-server URL
+  (e.g. `http://localhost:8080/#calibre`), which avoids the lock conflict that
+  occurs when the Calibre GUI has the on-disk library open.
+- **`calibre.automerge`** — how an import whose title+author already exist is
+  merged (`ignore`, `overwrite`, or `new_record`; default `ignore`).
+
 ## Notes on terminal image support
 
 `opdsview` queries the terminal at startup to detect its graphics protocol. On

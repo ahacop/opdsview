@@ -8,12 +8,15 @@ use ratatui_image::picker::Picker;
 
 use opdsview::app::{App, is_ctrl_c};
 use opdsview::cache::Cache;
-use opdsview::storage::{Config, cache_dir};
+use opdsview::storage::{self, Config, cache_dir};
 use opdsview::ui;
 use opdsview::worker::Worker;
 
 fn main() -> Result<()> {
     let config = Config::load()?;
+    // Install the user's path overrides before anything resolves a directory
+    // (the cache below, and the worker thread once spawned).
+    storage::install_settings(config.settings.clone());
     let cache = Cache::new(cache_dir()?)?;
     let worker = Worker::spawn(cache)?;
 
