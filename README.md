@@ -38,13 +38,45 @@ and read downloaded EPUBs in a built-in reader — all without leaving the termi
 - **Responsive UI** — all network I/O and image decoding happen on a background
   thread; the interface never blocks while loading.
 
-## Running
+## Installation
+
+### Homebrew
 
 ```sh
-cargo run --release
+brew install ahacop/tap/opdsview
 ```
 
-A `nix develop` shell with the full toolchain is provided via `flake.nix`.
+### Nix
+
+```sh
+nix run github:ahacop/opdsview
+# or install it into your profile
+nix profile install github:ahacop/opdsview
+```
+
+### From source
+
+Requires a Rust toolchain (2024 edition). A `nix develop` shell with the full
+toolchain is provided via `flake.nix`.
+
+```sh
+git clone https://github.com/ahacop/opdsview
+cd opdsview
+cargo build --release
+# the binary is then at target/release/opdsview
+```
+
+## Running
+
+Launch the installed binary, or run straight from a checkout:
+
+```sh
+opdsview            # if installed
+cargo run --release # from a source checkout (release is much faster for images)
+```
+
+On first run opdsview seeds a Project Gutenberg feed so you have something to
+browse immediately; add your own feeds with `n`.
 
 ## Controls
 
