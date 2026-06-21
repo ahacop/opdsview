@@ -82,6 +82,9 @@ pub enum Request {
         meta: Box<LibraryEntry>,
         url: String,
         mime: String,
+        /// The feed's title for this acquisition link, kept with a library save
+        /// so two same-format variants of a book can be told apart.
+        title: String,
         length: Option<u64>,
         cover_url: Option<String>,
         auth: Auth,
@@ -211,6 +214,7 @@ impl Worker {
                         meta,
                         url,
                         mime,
+                        title,
                         length,
                         cover_url,
                         auth,
@@ -223,6 +227,7 @@ impl Worker {
                             *meta,
                             &url,
                             &mime,
+                            &title,
                             length,
                             cover_url.as_deref(),
                             &auth,
@@ -579,6 +584,7 @@ fn download_book(
     meta: LibraryEntry,
     url: &str,
     mime: &str,
+    title: &str,
     length: Option<u64>,
     cover_url: Option<&str>,
     auth: &Auth,
@@ -588,7 +594,7 @@ fn download_book(
     match dest {
         DownloadDest::Library => {
             let cover_bytes = cover_url.and_then(|u| image_bytes(http, cache, u, auth).ok());
-            storage::save_book(meta, mime, length, url, &bytes, cover_bytes.as_deref())
+            storage::save_book(meta, mime, title, length, url, &bytes, cover_bytes.as_deref())
         }
         DownloadDest::Downloads => {
             storage::save_loose(&storage::downloads_dir()?, &meta, mime, url, &bytes)

@@ -1227,6 +1227,7 @@ impl App {
             return;
         }
         let mime = link.mime.clone();
+        let title = link.title.clone();
         let length = link.length;
         let (dest, status): (DownloadDest, &str) = match choice {
             Destination::Library => (DownloadDest::Library, "Downloading…"),
@@ -1246,6 +1247,7 @@ impl App {
             meta,
             url,
             mime,
+            title,
             length,
             cover_url,
             auth,

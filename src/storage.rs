@@ -311,6 +311,12 @@ pub struct LibraryFile {
     /// Absent in sidecars written before this was tracked.
     #[serde(default)]
     pub source_url: Option<String>,
+    /// The feed's title for this acquisition link (e.g. "Recommended compatible
+    /// epub"), so the library can label and tell apart two same-format variants
+    /// of one book. Empty when the feed supplied none, or in sidecars written
+    /// before titles were tracked.
+    #[serde(default)]
+    pub title: String,
 }
 
 /// A persisted record of one downloaded book: its catalog metadata plus the
@@ -472,7 +478,7 @@ fn library_to_entry(dir: &Path, meta: &LibraryEntry) -> Entry {
             rel: REL_ACQUISITION.to_string(),
             href: local(&f.filename),
             mime: f.mime.clone(),
-            title: String::new(),
+            title: f.title.clone(),
             length: f.length,
         });
     }
@@ -520,10 +526,13 @@ fn library_to_entry(dir: &Path, meta: &LibraryEntry) -> Entry {
 /// Persist a downloaded book: write the ebook (and, the first time, the cover),
 /// then write or merge the metadata sidecar. Re-downloading another format of
 /// the same book appends to the existing record rather than overwriting it.
-/// Returns the path of the saved ebook file.
+/// `title` is the feed's label for this acquisition link, kept so two
+/// same-format variants can be told apart. Returns the path of the saved ebook.
+#[allow(clippy::too_many_arguments)]
 pub fn save_book(
     meta: LibraryEntry,
     mime: &str,
+    title: &str,
     length: Option<u64>,
     ebook_url: &str,
     ebook_bytes: &[u8],
@@ -533,6 +542,7 @@ pub fn save_book(
         &library_dir()?,
         meta,
         mime,
+        title,
         length,
         ebook_url,
         ebook_bytes,
@@ -545,6 +555,7 @@ fn save_book_in(
     dir: &Path,
     meta: LibraryEntry,
     mime: &str,
+    title: &str,
     length: Option<u64>,
     ebook_url: &str,
     ebook_bytes: &[u8],
@@ -568,25 +579,37 @@ fn save_book_in(
     let progress = existing.as_ref().and_then(|e| e.progress.clone());
     let mut cover_file = existing.and_then(|e| e.cover_file);
 
-    // Write the ebook file.
+    // The record this download updates: the same variant (matched by its source
+    // URL), or — for sidecars written before URLs were tracked — a legacy record
+    // of the same extension, adopted so re-downloading it updates in place rather
+    // than leaving a stale duplicate.
     let ext = ext_for_mime(mime)
         .map(str::to_string)
         .unwrap_or_else(|| ext_from_url(ebook_url));
-    let ebook_name = format!("{id}.{ext}");
+    let legacy_name = format!("{id}.{ext}");
+    let target = files.iter().position(|f| {
+        f.source_url.as_deref() == Some(ebook_url)
+            || (f.source_url.is_none() && f.filename == legacy_name)
+    });
+    // A genuinely new variant gets its own unique filename, so a second format
+    // that shares an extension (e.g. a "recommended" and an "advanced" EPUB)
+    // each keep their own file instead of one clobbering the other.
+    let ebook_name = match target {
+        Some(i) => files[i].filename.clone(),
+        None => unique_ebook_name(&files, &id, &ext),
+    };
     let ebook_path = dir.join(&ebook_name);
     fs::write(&ebook_path, ebook_bytes)
         .with_context(|| format!("writing {}", ebook_path.display()))?;
-    // Update-or-insert by filename: two formats that share an extension (e.g. a
-    // "recommended" and an "advanced" EPUB) occupy the same file, so the record
-    // reflects whichever variant was downloaded last — including its source URL.
     let file = LibraryFile {
         mime: mime.to_string(),
-        filename: ebook_name.clone(),
+        filename: ebook_name,
         length: length.or(Some(ebook_bytes.len() as u64)),
         source_url: Some(ebook_url.to_string()),
+        title: title.to_string(),
     };
-    match files.iter_mut().find(|f| f.filename == ebook_name) {
-        Some(existing) => *existing = file,
+    match target {
+        Some(i) => files[i] = file,
         None => files.push(file),
     }
 
@@ -1064,6 +1087,22 @@ fn ext_for_mime(mime: &str) -> Option<&'static str> {
     }
 }
 
+/// A library ebook filename `{id}.{ext}` not already used by one of `files`,
+/// disambiguating a second same-extension variant as `{id}-2.{ext}`,
+/// `{id}-3.{ext}`, …. The numbering only has to be unique within one book, so it
+/// is derived from the records on hand rather than scanning the directory.
+fn unique_ebook_name(files: &[LibraryFile], id: &str, ext: &str) -> String {
+    let taken = |name: &str| files.iter().any(|f| f.filename == name);
+    let base = format!("{id}.{ext}");
+    if !taken(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{id}-{n}.{ext}"))
+        .find(|name| !taken(name))
+        .expect("an unused suffix exists")
+}
+
 /// Fall back to the extension on a download URL's last path segment.
 fn ext_from_url(url: &str) -> String {
     url::Url::parse(url)
@@ -1172,6 +1211,7 @@ mod tests {
             &dir,
             sample_meta(),
             "application/epub+zip",
+            "",
             Some(123),
             "https://se.org/book.epub",
             b"EPUBDATA",
@@ -1232,6 +1272,7 @@ mod tests {
             &dir,
             sample_meta(),
             "application/epub+zip",
+            "",
             Some(123),
             "https://se.org/book.epub",
             b"EPUBDATA",
@@ -1277,6 +1318,7 @@ mod tests {
             &dir,
             sample_meta(),
             "application/epub+zip",
+            "",
             None,
             "https://se.org/b.epub",
             b"E",
@@ -1287,6 +1329,7 @@ mod tests {
             &dir,
             sample_meta(),
             "application/x-mobipocket-ebook",
+            "",
             None,
             "https://se.org/b.azw3",
             b"A",
@@ -1304,12 +1347,73 @@ mod tests {
     }
 
     #[test]
+    fn two_same_format_variants_are_kept_as_distinct_files() {
+        let dir = temp_dir("variants");
+        // Two EPUB variants of one book (same MIME, different URLs and titles).
+        save_book_in(
+            &dir,
+            sample_meta(),
+            "application/epub+zip",
+            "Recommended compatible epub",
+            None,
+            "https://se.org/b.epub",
+            b"RECOMMENDED",
+            Some(b"C"),
+        )
+        .unwrap();
+        let advanced = save_book_in(
+            &dir,
+            sample_meta(),
+            "application/epub+zip",
+            "Advanced epub",
+            None,
+            "https://se.org/b-advanced.epub",
+            b"ADVANCED",
+            None,
+        )
+        .unwrap();
+
+        let books = load_library_from(&dir).unwrap();
+        assert_eq!(books.len(), 1);
+        let acq: Vec<_> = books[0].entry.acquisition_links().collect();
+        // Both EPUBs survive as separate files, labeled by their feed titles.
+        assert_eq!(acq.len(), 2);
+        let titles: Vec<&str> = acq.iter().map(|l| l.title.as_str()).collect();
+        assert!(titles.contains(&"Recommended compatible epub"));
+        assert!(titles.contains(&"Advanced epub"));
+        // The advanced variant did not clobber the first: distinct files, each
+        // with its own bytes.
+        let hrefs: HashSet<&str> = acq.iter().map(|l| l.href.as_str()).collect();
+        assert_eq!(hrefs.len(), 2);
+        assert_eq!(fs::read(&advanced).unwrap(), b"ADVANCED");
+
+        // Re-downloading the recommended variant updates it in place — no third
+        // file appears.
+        save_book_in(
+            &dir,
+            sample_meta(),
+            "application/epub+zip",
+            "Recommended compatible epub",
+            None,
+            "https://se.org/b.epub",
+            b"RECOMMENDED2",
+            None,
+        )
+        .unwrap();
+        let books = load_library_from(&dir).unwrap();
+        assert_eq!(books[0].entry.acquisition_links().count(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn save_progress_round_trips_and_survives_redownload() {
         let dir = temp_dir("progress");
         save_book_in(
             &dir,
             sample_meta(),
             "application/epub+zip",
+            "",
             None,
             "https://se.org/b.epub",
             b"E",
@@ -1334,6 +1438,7 @@ mod tests {
             &dir,
             sample_meta(),
             "application/x-mobipocket-ebook",
+            "",
             None,
             "https://se.org/b.azw3",
             b"A",
@@ -1352,6 +1457,7 @@ mod tests {
             &dir,
             sample_meta(),
             "application/epub+zip",
+            "",
             None,
             "https://se.org/b.epub",
             b"E",
@@ -1384,6 +1490,7 @@ mod tests {
             &dir,
             sample_meta(),
             "application/epub+zip",
+            "",
             None,
             "https://se.org/b.epub",
             b"E",
@@ -1407,6 +1514,7 @@ mod tests {
             &dir,
             sample_meta(),
             "application/epub+zip",
+            "",
             None,
             "https://se.org/b.epub",
             b"E",
@@ -1417,6 +1525,7 @@ mod tests {
             &dir,
             sample_meta(),
             "application/x-mobipocket-ebook",
+            "",
             None,
             "https://se.org/b.azw3",
             b"A",
@@ -1433,12 +1542,13 @@ mod tests {
         assert!(urls.contains("https://se.org/b.epub"));
         assert!(urls.contains("https://se.org/b.azw3"));
 
-        // Re-downloading another EPUB *variant* shares the .epub file, so the
-        // record tracks only the latest variant's URL — not both EPUBs.
+        // A second EPUB *variant* is kept as its own file alongside the first, so
+        // both EPUB source URLs are now indexed.
         save_book_in(
             &dir,
             sample_meta(),
             "application/epub+zip",
+            "Advanced epub",
             None,
             "https://se.org/b-advanced.epub",
             b"E2",
@@ -1447,9 +1557,9 @@ mod tests {
         .unwrap();
         let urls = library_format_sources_in(&dir).unwrap();
         let urls = urls.get(&id).unwrap();
-        assert_eq!(urls.len(), 2);
+        assert_eq!(urls.len(), 3);
+        assert!(urls.contains("https://se.org/b.epub"));
         assert!(urls.contains("https://se.org/b-advanced.epub"));
-        assert!(!urls.contains("https://se.org/b.epub"));
 
         let _ = fs::remove_dir_all(&dir);
     }

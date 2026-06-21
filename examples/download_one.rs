@@ -42,6 +42,7 @@ fn main() -> anyhow::Result<()> {
         meta: Box::new(LibraryEntry::from_entry(entry)),
         url: link.href.clone(),
         mime: link.mime.clone(),
+        title: link.title.clone(),
         length: link.length,
         cover_url: entry.image_link().map(|l| l.href.clone()),
         auth,
