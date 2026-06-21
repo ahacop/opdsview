@@ -1,9 +1,9 @@
 # opdsview
 
-A terminal UI for browsing and reading [OPDS](https://opds.io/) e-book catalogs,
-written in Rust with [ratatui](https://ratatui.rs/). Add catalog feeds, browse
-and search them with cover art rendered inline, download books, and read
-downloaded EPUBs in a built-in reader — all without leaving the terminal.
+A terminal app for browsing, downloading, and reading [OPDS](https://opds.io/)
+e-book catalogs. Add catalog feeds, search them with cover art shown inline,
+download books straight into your [Calibre](https://calibre-ebook.com/) library,
+and read downloaded EPUBs in a built-in reader — all without leaving the terminal.
 
 ![opdsview browsing a catalog with an inline cover and publication detail](docs/screenshot.png)
 
@@ -19,8 +19,13 @@ downloaded EPUBs in a built-in reader — all without leaving the terminal.
   press `/` to run a full-text query and browse the results like any other feed.
 - **Publication detail & downloads** — press `Enter` on a book to open a full
   detail page with its cover, full description, metadata, and a list of
-  downloadable formats (with file sizes). Pick a format and download it to your
-  `Downloads/opdsview/` folder.
+  downloadable formats (with file sizes). Pick a format, then choose where it
+  goes: the built-in library, your `~/Downloads` folder, or straight into Calibre.
+- **Import to Calibre** — send a downloaded book directly into your Calibre
+  library via `calibredb`, no manual file shuffling. New formats merge into an
+  existing book, and catalog listings mark the titles already in your library so
+  you can see at a glance what you still need. Works against an on-disk library
+  or a running Calibre content server.
 - **Built-in EPUB reader** — read downloaded EPUBs without leaving the terminal:
   styled, reflowed text with inline images, chapter and table-of-contents
   navigation, and your reading position remembered per book. Other formats
