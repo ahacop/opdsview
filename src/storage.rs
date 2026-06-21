@@ -1056,7 +1056,10 @@ mod tests {
             automerge = "overwrite"
         "#;
         let cfg: UserConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.settings.library_dir.as_deref(), Some("~/Books/opdsview"));
+        assert_eq!(
+            cfg.settings.library_dir.as_deref(),
+            Some("~/Books/opdsview")
+        );
         // Untouched fields fall back to None / their defaults.
         assert_eq!(cfg.settings.cache_dir, None);
         assert_eq!(cfg.calibre.command(), "/opt/calibre/calibredb");

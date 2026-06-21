@@ -1,11 +1,10 @@
 //! Application state, input handling, and response handling.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
-use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 
 use crate::opds::{Entry, Feed};
@@ -191,11 +190,24 @@ impl BrowserState {
 }
 
 /// Loaded state of a cover image, keyed by image URL (or local file path).
+///
+/// A `Ready` cover is a plain ratatui-image [`StatefulProtocol`], which
+/// [`StatefulImage`](ratatui_image::StatefulImage) resizes and encodes inline at
+/// render time. That render-time encode is the one thing the UI thread does for
+/// the single selected cover; the event loop's cover debounce keeps it from
+/// happening mid-scroll.
 pub enum ImageSlot {
     Loading,
     Ready(Box<StatefulProtocol>),
     Failed,
 }
+
+/// How many fetched images (covers and reader inline images) are kept resident
+/// at once. Covers are fetched lazily one at a time now, so this is generous; it
+/// only bounds memory over a long session that browses many feeds. Least-
+/// recently-loaded entries are evicted past this, and a re-viewed cover reloads
+/// from the immutable on-disk cache, so eviction only ever costs a quick reload.
+const MAX_CACHED_IMAGES: usize = 64;
 
 /// Progress of a book download, keyed by its acquisition URL.
 pub enum DownloadSlot {
@@ -408,15 +420,17 @@ pub struct App {
     /// Outgoing network requests, drained by the main loop after each update.
     pub outbox: Vec<Request>,
     pub images: HashMap<String, ImageSlot>,
+    /// Keys of loaded (`Ready`/`Failed`) images in least-recently-loaded order,
+    /// so [`MAX_CACHED_IMAGES`] can bound `images` by evicting the oldest.
+    image_order: VecDeque<String>,
     /// Book downloads in progress or completed, keyed by acquisition URL.
     pub downloads: HashMap<String, DownloadSlot>,
     /// Scraped reading metrics, keyed by a publication's web page URL.
     pub reading: HashMap<String, ReadingSlot>,
-    pub picker: Picker,
 }
 
 impl App {
-    pub fn new(config: Config, user: UserConfig, picker: Picker) -> Self {
+    pub fn new(config: Config, user: UserConfig) -> Self {
         let mut feed_list = ListState::default();
         // Row 0 is always the pinned "Downloaded books" library entry.
         feed_list.select(Some(0));
@@ -435,9 +449,9 @@ impl App {
             should_quit: false,
             outbox: Vec::new(),
             images: HashMap::new(),
+            image_order: VecDeque::new(),
             downloads: HashMap::new(),
             reading: HashMap::new(),
-            picker,
         }
     }
 
@@ -452,6 +466,20 @@ impl App {
             Screen::Browser(b) => b.search_query.is_some(),
             Screen::Reader(r) => r.search.input.is_some() || r.toc_open,
             _ => false,
+        }
+    }
+
+    /// The image URL of the cover that the browser would draw right now (the
+    /// selected entry's), if any. The event loop compares this across an input
+    /// batch to tell whether the selection moved to a different cover, so it can
+    /// hold the (expensive) cover render back during a fast scroll.
+    pub fn selected_cover_url(&self) -> Option<String> {
+        match &self.screen {
+            Screen::Browser(b) if b.detail.is_none() => b
+                .selected_entry()
+                .and_then(|e| e.image_link())
+                .map(|l| l.href.clone()),
+            _ => None,
         }
     }
 
@@ -1488,6 +1516,26 @@ impl App {
         self.outbox.push(Request::Image { url, auth });
     }
 
+    /// Insert a freshly fetched image as the most-recently-used entry, evicting
+    /// the least-recently-loaded ones once past [`MAX_CACHED_IMAGES`].
+    ///
+    /// Only loaded slots (`Ready`/`Failed`) flow through here, so the cap bounds
+    /// the images that actually hold data; transient `Loading` placeholders are
+    /// left untracked. A re-received key is refreshed to most-recent. Evicting a
+    /// cover that's still on screen is harmless: the next render re-requests it
+    /// and it reloads from the immutable cache.
+    fn insert_image(&mut self, key: String, slot: ImageSlot) {
+        self.image_order.retain(|k| k != &key);
+        self.image_order.push_back(key.clone());
+        self.images.insert(key, slot);
+        while self.image_order.len() > MAX_CACHED_IMAGES {
+            let Some(evicted) = self.image_order.pop_front() else {
+                break;
+            };
+            self.images.remove(&evicted);
+        }
+    }
+
     /// Queue a reading-metrics scrape for the currently selected entry's web
     /// page, if it has one and we haven't already fetched (or seeded) it. The
     /// metrics are Standard Ebooks-specific; other catalogs resolve to
@@ -1516,12 +1564,12 @@ impl App {
     pub fn handle_response(&mut self, resp: Response) {
         match resp {
             Response::Feed { url, result } => self.on_feed(url, result),
-            Response::Image { url, result, .. } => {
+            Response::Image { url, result } => {
                 let slot = match result {
-                    Ok(img) => ImageSlot::Ready(Box::new(self.picker.new_resize_protocol(img))),
+                    Ok(protocol) => ImageSlot::Ready(Box::new(protocol)),
                     Err(_) => ImageSlot::Failed,
                 };
-                self.images.insert(url, slot);
+                self.insert_image(url, slot);
             }
             Response::Download { url, kind, result } => {
                 let slot = match result {
@@ -1836,5 +1884,49 @@ mod tests {
         let feed = lib.build_feed("Downloaded books");
         assert_eq!(feed.entries.len(), 1);
         assert_eq!(feed.entries[0].title, "Beta");
+    }
+
+    fn ready_image() -> ImageSlot {
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let img = image::DynamicImage::new_rgba8(40, 60);
+        ImageSlot::Ready(Box::new(picker.new_resize_protocol(img)))
+    }
+
+    // The image cache evicts the least-recently-loaded entries past the cap, so a
+    // long browsing session can't grow `images` without bound.
+    #[test]
+    fn insert_image_evicts_oldest_past_the_cap() {
+        let mut app = App::new(Config::default(), UserConfig::default());
+        for i in 0..MAX_CACHED_IMAGES + 5 {
+            app.insert_image(format!("cover-{i}"), ready_image());
+        }
+        assert_eq!(app.images.len(), MAX_CACHED_IMAGES);
+        assert_eq!(app.image_order.len(), MAX_CACHED_IMAGES);
+        // The first five keys were evicted; the most recent ones remain.
+        assert!(!app.images.contains_key("cover-0"));
+        assert!(!app.images.contains_key("cover-4"));
+        assert!(app.images.contains_key("cover-5"));
+        assert!(
+            app.images
+                .contains_key(&format!("cover-{}", MAX_CACHED_IMAGES + 4))
+        );
+    }
+
+    // Re-inserting a key refreshes it to most-recent, so it survives eviction
+    // that a stale key wouldn't.
+    #[test]
+    fn insert_image_refreshes_recency_on_reinsert() {
+        let mut app = App::new(Config::default(), UserConfig::default());
+        app.insert_image("keep".to_string(), ready_image());
+        // Fill the rest of the cap, then refresh "keep" so it's newest again.
+        for i in 0..MAX_CACHED_IMAGES - 1 {
+            app.insert_image(format!("filler-{i}"), ready_image());
+        }
+        app.insert_image("keep".to_string(), ready_image());
+        // One more distinct insert evicts the oldest filler, not "keep".
+        app.insert_image("new".to_string(), ready_image());
+        assert!(app.images.contains_key("keep"));
+        assert!(!app.images.contains_key("filler-0"));
+        assert_eq!(app.images.len(), MAX_CACHED_IMAGES);
     }
 }

@@ -28,7 +28,11 @@ const ACCENT: Color = Color::Cyan;
 /// border (degrades gracefully when the list is shorter than the viewport).
 const LIST_SCROLL_PADDING: usize = 5;
 
-pub fn render(frame: &mut Frame, app: &mut App) {
+/// `show_covers` is cleared by the event loop during a fast scroll, so the
+/// browser draws only its (cheap) text and skips the cover image entirely —
+/// image rendering then never throttles scrolling. The cover is drawn once the
+/// scroll settles.
+pub fn render(frame: &mut Frame, app: &mut App, show_covers: bool) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -89,6 +93,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 &app.reading,
                 &app.downloaded_ids,
                 &app.calibre_ids,
+                show_covers,
             );
             render_help(frame, chunks[2], help);
         }
@@ -290,10 +295,12 @@ fn render_browser(
     reading: &HashMap<String, ReadingSlot>,
     downloaded: &HashSet<String>,
     calibre: &HashSet<String>,
+    show_covers: bool,
 ) {
     let Screen::Browser(b) = screen else { return };
 
-    // The detail "show page" takes over the whole browser area when open.
+    // The detail "show page" takes over the whole browser area when open. It's a
+    // focused single-book view, never fast-scrolled, so its cover always draws.
     if b.detail.is_some() {
         render_detail_page(frame, area, b, images, downloads, reading, calibre);
         return;
@@ -305,7 +312,7 @@ fn render_browser(
         .split(area);
 
     render_entry_list(frame, panes[0], b, downloaded, calibre);
-    render_detail(frame, panes[1], b, images, reading);
+    render_detail(frame, panes[1], b, images, reading, show_covers);
 }
 
 fn render_entry_list(
@@ -445,6 +452,7 @@ fn render_detail(
     b: &BrowserState,
     images: &mut HashMap<String, ImageSlot>,
     reading: &HashMap<String, ReadingSlot>,
+    show_covers: bool,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -463,7 +471,7 @@ fn render_detail(
         .split(inner);
 
     let reading_slot = entry.web_link().and_then(|l| reading.get(&l.href));
-    render_cover(frame, split[0], entry, images);
+    render_cover(frame, split[0], entry, images, show_covers);
     render_entry_text(frame, split[1], entry, reading_slot);
 }
 
@@ -472,7 +480,13 @@ fn render_cover(
     area: Rect,
     entry: &Entry,
     images: &mut HashMap<String, ImageSlot>,
+    show_covers: bool,
 ) {
+    // Mid-scroll the cover is held back: skip it so this draw stays cheap and the
+    // scroll runs at full speed. The pane is left blank until the scroll settles.
+    if !show_covers {
+        return;
+    }
     let Some(link) = entry.image_link() else {
         let p = Paragraph::new(Span::styled(
             "no cover",
@@ -680,7 +694,7 @@ fn render_detail_page(
         horizontal: 2,
         vertical: 0,
     });
-    render_cover(frame, cover_area, entry, images);
+    render_cover(frame, cover_area, entry, images, true);
 
     // Right column: metadata/description on top, download formats below.
     let acquisitions: Vec<&crate::opds::Link> = entry.acquisition_links().collect();

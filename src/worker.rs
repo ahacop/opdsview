@@ -6,12 +6,15 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use epub::doc::{EpubDoc, NavPoint};
 use image::DynamicImage;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
 
 use crate::cache::Cache;
 use crate::opds::Feed;
@@ -21,6 +24,13 @@ use crate::storage::{self, LibraryBook, LibraryEntry, ReadingProgress};
 
 /// How long a cached feed response is considered fresh.
 const FEED_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Number of cover images fetched and decoded concurrently. Covers are fetched
+/// lazily — the selected entry's in the browser, a chapter's inline images in
+/// the reader — so only a handful are ever in flight at once; a small pool
+/// overlaps their network latency while keeping the shared HTTP client's
+/// connections alive and reused.
+const IMAGE_WORKERS: usize = 6;
 
 type Auth = Option<(String, String)>;
 
@@ -121,9 +131,11 @@ pub enum Response {
         url: String,
         result: Result<Feed>,
     },
+    /// A fetched+decoded cover, already wrapped in a resize protocol (built on
+    /// the worker, not the UI thread). Keyed by image URL (or local file path).
     Image {
         url: String,
-        result: Result<DynamicImage>,
+        result: Result<StatefulProtocol>,
     },
     Download {
         url: String,
@@ -159,11 +171,14 @@ pub enum Response {
 /// Handle to the worker thread.
 pub struct Worker {
     tx: Sender<Request>,
-    pub rx: Receiver<Response>,
 }
 
 impl Worker {
-    pub fn spawn(cache: Cache) -> Result<Self> {
+    /// Spawn the worker threads and return the handle alongside the channel on
+    /// which responses arrive. The caller owns the [`Receiver`] so it can fold
+    /// responses into its own event source (the UI forwards them into a unified
+    /// channel it blocks on, so a completed fetch/encode wakes the loop at once).
+    pub fn spawn(cache: Cache, picker: Picker) -> Result<(Self, Receiver<Response>)> {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Request>();
         let (resp_tx, resp_rx) = std::sync::mpsc::channel::<Response>();
 
@@ -173,6 +188,12 @@ impl Worker {
             .build()
             .context("building HTTP client")?;
 
+        // The cover-fetch pool runs off the UI thread and reports on `resp_tx`:
+        // it fetches+decodes covers and builds their resize protocols
+        // (network-bound). The dispatcher below forwards every `Request::Image`
+        // to it. The `picker` builds protocols; cloned where needed.
+        let img_tx = spawn_image_pool(http.clone(), cache.clone(), picker.clone(), resp_tx.clone());
+
         thread::spawn(move || {
             while let Ok(req) = req_rx.recv() {
                 match req {
@@ -181,8 +202,10 @@ impl Worker {
                         let _ = resp_tx.send(Response::Feed { url, result });
                     }
                     Request::Image { url, auth } => {
-                        let result = fetch_image(&http, &cache, &url, &auth);
-                        let _ = resp_tx.send(Response::Image { url, result });
+                        // Hand off to the image pool so a burst of prefetch
+                        // requests downloads concurrently instead of blocking
+                        // the dispatcher (and every other request) one by one.
+                        let _ = img_tx.send((url, auth));
                     }
                     Request::Download {
                         meta,
@@ -244,7 +267,10 @@ impl Worker {
                         src,
                         key,
                     } => {
-                        let result = fetch_book_image(&path, chapter, &src);
+                        // Decode and build the protocol here; the UI thread only
+                        // wraps and renders it, and the resize pool encodes it.
+                        let result = fetch_book_image(&path, chapter, &src)
+                            .map(|img| picker.new_resize_protocol(img));
                         let _ = resp_tx.send(Response::Image { url: key, result });
                     }
                     Request::SaveProgress { id, progress } => {
@@ -254,10 +280,7 @@ impl Worker {
             }
         });
 
-        Ok(Self {
-            tx: req_tx,
-            rx: resp_rx,
-        })
+        Ok((Self { tx: req_tx }, resp_rx))
     }
 
     pub fn request(&self, req: Request) {
@@ -265,16 +288,111 @@ impl Worker {
     }
 }
 
-fn get_bytes(http: &reqwest::blocking::Client, url: &str, auth: &Auth) -> Result<Vec<u8>> {
-    let mut req = http.get(url);
-    if let Some((user, pass)) = auth {
-        req = req.basic_auth(user, Some(pass));
+/// Spawn the [`IMAGE_WORKERS`]-strong cover-fetch pool and return the sender the
+/// dispatcher uses to feed it `(url, auth)` jobs.
+///
+/// The workers share one job receiver behind a mutex; each holds the lock only
+/// long enough to take the next job, then releases it before the slow
+/// fetch+decode, so the others keep working in parallel. Each fetched cover is
+/// decoded and wrapped in a resize protocol (via the cloned `picker`) right
+/// here, off the UI thread, and sent back on `resp_tx` as a [`Response::Image`].
+fn spawn_image_pool(
+    http: reqwest::blocking::Client,
+    cache: Cache,
+    picker: Picker,
+    resp_tx: Sender<Response>,
+) -> Sender<(String, Auth)> {
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<(String, Auth)>();
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    for _ in 0..IMAGE_WORKERS {
+        let http = http.clone();
+        let cache = cache.clone();
+        let picker = picker.clone();
+        let resp_tx = resp_tx.clone();
+        let job_rx = Arc::clone(&job_rx);
+        thread::spawn(move || {
+            // The lock guard is dropped at the end of this block expression, so
+            // the fetch below runs without holding it.
+            while let Ok((url, auth)) = {
+                let rx = job_rx.lock().unwrap();
+                rx.recv()
+            } {
+                let result = fetch_image(&http, &cache, &url, &auth)
+                    .map(|img| picker.new_resize_protocol(img));
+                let _ = resp_tx.send(Response::Image { url, result });
+            }
+        });
     }
-    let resp = req.send().with_context(|| format!("requesting {url}"))?;
-    let resp = resp
-        .error_for_status()
-        .with_context(|| format!("server returned an error for {url}"))?;
-    Ok(resp.bytes()?.to_vec())
+    job_tx
+}
+
+/// How many times a rate-limited request is retried before giving up.
+const MAX_RETRIES: u32 = 4;
+
+fn get_bytes(http: &reqwest::blocking::Client, url: &str, auth: &Auth) -> Result<Vec<u8>> {
+    let mut attempt = 0;
+    loop {
+        let mut req = http.get(url);
+        if let Some((user, pass)) = auth {
+            req = req.basic_auth(user, Some(pass));
+        }
+        let resp = req.send().with_context(|| format!("requesting {url}"))?;
+        // Back off and retry on rate-limit / temporary-unavailable responses.
+        // Prefetching a page of covers fires a burst of concurrent requests,
+        // which a catalog may answer with 429; honoring Retry-After (and
+        // backing off otherwise) keeps us a well-behaved client instead of
+        // hammering the server and getting every cover rejected.
+        if is_retryable(resp.status()) && attempt < MAX_RETRIES {
+            let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt, url));
+            attempt += 1;
+            thread::sleep(wait);
+            continue;
+        }
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("server returned an error for {url}"))?;
+        return Ok(resp.bytes()?.to_vec());
+    }
+}
+
+/// Whether a status means "slow down / try again shortly" rather than a hard
+/// failure: `429 Too Many Requests` or `503 Service Unavailable`.
+fn is_retryable(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+}
+
+/// The server-requested wait from a `Retry-After` header, when given as an
+/// integer number of seconds (clamped to 30s). The HTTP-date form is ignored —
+/// we fall back to [`backoff`] — which keeps this dependency-free; rate limiters
+/// almost always use the seconds form.
+fn retry_after(resp: &reqwest::blocking::Response) -> Option<Duration> {
+    let secs: u64 = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(secs.min(30)))
+}
+
+/// Exponential backoff before a retry (500ms, 1s, 2s, …, capped at 8s) plus a
+/// small deterministic per-URL jitter, so a pool that all trips the limit at the
+/// same instant doesn't retry in lockstep.
+fn backoff(attempt: u32, url: &str) -> Duration {
+    let base = Duration::from_millis(500)
+        .saturating_mul(1u32 << attempt.min(4))
+        .min(Duration::from_secs(8));
+    let jitter = Duration::from_millis((url_hash(url) % 250) as u64);
+    base + jitter
+}
+
+/// A cheap, stable hash of a URL, used only to spread out retry jitter.
+fn url_hash(url: &str) -> u32 {
+    url.bytes()
+        .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32))
 }
 
 fn fetch_feed(
@@ -488,5 +606,39 @@ fn download_book(
             url,
             &bytes,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_statuses_are_only_429_and_503() {
+        use reqwest::StatusCode;
+        assert!(is_retryable(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_retryable(StatusCode::OK));
+        assert!(!is_retryable(StatusCode::NOT_FOUND));
+        assert!(!is_retryable(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[test]
+    fn backoff_grows_then_caps_and_stays_bounded() {
+        let url = "https://example.org/cover.jpg";
+        // Jitter is under 250ms, so compare against the exponential base.
+        let ms = |a| backoff(a, url).as_millis();
+        assert!(ms(0) >= 500 && ms(0) < 750);
+        assert!(ms(1) >= 1000 && ms(1) < 1250);
+        assert!(ms(2) >= 2000 && ms(2) < 2250);
+        // Caps at 8s + jitter and never grows past it, however high the attempt.
+        assert!(ms(4) >= 8000 && ms(4) < 8250);
+        assert!(ms(99) < 8250);
+    }
+
+    #[test]
+    fn url_hash_is_stable_and_varies_by_url() {
+        assert_eq!(url_hash("https://a/x.jpg"), url_hash("https://a/x.jpg"));
+        assert_ne!(url_hash("https://a/x.jpg"), url_hash("https://a/y.jpg"));
     }
 }

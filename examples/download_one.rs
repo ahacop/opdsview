@@ -34,7 +34,10 @@ fn main() -> anyhow::Result<()> {
     let link = entry.acquisition_links().next().unwrap();
     println!("Downloading {:?}: {}", entry.title, link.href);
 
-    let worker = Worker::spawn(Cache::new(cache_dir()?)?)?;
+    // Headless check: no terminal to query, so a half-blocks picker suffices
+    // (this path downloads, it doesn't render covers).
+    let picker = ratatui_image::picker::Picker::halfblocks();
+    let (worker, responses) = Worker::spawn(Cache::new(cache_dir()?)?, picker)?;
     worker.request(Request::Download {
         meta: Box::new(LibraryEntry::from_entry(entry)),
         url: link.href.clone(),
@@ -45,7 +48,7 @@ fn main() -> anyhow::Result<()> {
         dest: DownloadDest::Library,
     });
 
-    match worker.rx.recv_timeout(Duration::from_secs(60))? {
+    match responses.recv_timeout(Duration::from_secs(60))? {
         Response::Download { result, .. } => match result {
             Ok(path) => {
                 let size = std::fs::metadata(&path)?.len();
