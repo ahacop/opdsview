@@ -1,0 +1,35 @@
+# Builds the flake's default package and pushes the result to the
+# ahacop Cachix cache, so `nix run github:ahacop/opdsview` and flake
+# consumers get a prebuilt binary instead of compiling from source.
+#
+# Only the build result's runtime closure is pushed, not the Rust
+# toolchain or other build-time dependencies. Paths that already
+# exist on cache.nixos.org are skipped by cachix.
+name: Nix
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: ahacop
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: true
+      - run: nix build --print-build-logs
+      - name: Push binary to Cachix
+        if: github.event_name != 'pull_request'
+        run: cachix push ahacop ./result
